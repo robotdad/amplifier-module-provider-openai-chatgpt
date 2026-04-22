@@ -98,17 +98,17 @@ class ChatGPTProvider:
 
     def __init__(
         self,
-        config: dict[str, Any],
-        coordinator: Any,
-        tokens: dict[str, Any] | None,
+        config: dict[str, Any] | None = None,
+        coordinator: Any = None,
+        tokens: dict[str, Any] | None = None,
     ) -> None:
-        self._config = config
+        self._config = config or {}
         self._coordinator = coordinator
         self._tokens = tokens
 
-        self.raw: bool = bool(config.get("raw", False))
-        self.default_model: str = config.get("default_model", "gpt-4o")
-        self.timeout: float = float(config.get("timeout", 300.0))
+        self.raw: bool = bool(self._config.get("raw", False))
+        self.default_model: str = self._config.get("default_model", "gpt-4o")
+        self.timeout: float = float(self._config.get("timeout", 300.0))
 
         # Lazy httpx client — created on first use
         self._client: httpx.AsyncClient | None = None
