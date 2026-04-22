@@ -106,6 +106,7 @@ class ChatGPTProvider:
         self._coordinator = coordinator
         self._tokens = tokens
 
+        self.priority: int = int(self._config.get("priority", 100))
         self.raw: bool = bool(self._config.get("raw", False))
         self.default_model: str = self._config.get("default_model", "gpt-4o")
         self.timeout: float = float(self._config.get("timeout", 300.0))
