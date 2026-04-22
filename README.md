@@ -82,33 +82,26 @@ uv run ruff check .
 uv run ruff format --check .
 ```
 
-### Testing with a Local Amplifier Install
+### Testing with Amplifier
 
-**Option A: CLI source override (quickest for dev testing)**
+Register the module, install it, and add it through the standard provider management flow:
 
 ```bash
-# Register the local checkout
-amplifier source add provider-openai-chatgpt \
-  /path/to/amplifier-module-provider-openai-chatgpt \
-  --local
+# 1. Register the module source
+amplifier module add provider-openai-chatgpt \
+  --source /path/to/amplifier-module-provider-openai-chatgpt
 
-# Verify
-amplifier source list
+# 2. Install the provider
+amplifier provider install openai-chatgpt --force
 
-# Test
-amplifier run "Hello, can you hear me?"
+# 3. Add and configure via the interactive wizard
+amplifier provider add openai-chatgpt
 
-# Cleanup when done
-amplifier source remove provider-openai-chatgpt --local
+# 4. Or use the management dashboard
+amplifier provider manage
 ```
 
-The `--local` flag writes to `.amplifier/settings.local.yaml` (gitignored). No `file:///` prefix needed -- just a bare path.
-
-Your active bundle must include the provider in its `providers:` section for Amplifier to load it.
-
-**Option B: Inline source in a test bundle (self-contained)**
-
-Create a test bundle file (e.g. `test-chatgpt.md`):
+You can also wire it into a bundle directly with an inline `source:` field:
 
 ```markdown
 ---
@@ -128,8 +121,6 @@ providers:
 
 # Test: provider-openai-chatgpt
 ```
-
-Then run directly against it:
 
 ```bash
 amplifier run --bundle ./test-chatgpt.md "Hello, can you hear me?"
