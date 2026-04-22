@@ -1106,3 +1106,91 @@ class TestComplete:
         request_calls = [c for c in calls if c.args[0] == "llm:request"]
         event_data = request_calls[0].args[1]
         assert "payload" not in event_data
+
+
+# ---------------------------------------------------------------------------
+# TestCompleteErrors — error handling paths in complete()
+# ---------------------------------------------------------------------------
+
+
+class TestCompleteErrors:
+    """Verify error handling in complete(): error events emitted before exceptions propagate."""
+
+    def _make_provider_with_tokens(self) -> object:
+        """Create ChatGPTProvider with valid OAuth tokens and a mock coordinator."""
+        from datetime import datetime, timedelta, timezone
+
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        expires_at = (datetime.now(tz=timezone.utc) + timedelta(hours=1)).isoformat()
+        tokens = {
+            "access_token": "test-access-token",
+            "account_id": "acct-123",
+            "expires_at": expires_at,
+        }
+        coordinator = MagicMock()
+        coordinator.hooks.emit = AsyncMock()
+        return ChatGPTProvider({"default_model": "gpt-4o"}, coordinator, tokens)
+
+    def _make_request(self) -> object:  # type: ignore[return]
+        from amplifier_core.message_models import ChatRequest, Message
+
+        return ChatRequest(messages=[Message(role="user", content="hello")])
+
+    @pytest.mark.asyncio
+    async def test_sse_error_event_emits_error_status_then_raises(self) -> None:
+        """SSE error event inside stream emits llm:response with status='error', then raises SSEError."""
+        from amplifier_module_provider_openai_chatgpt._sse import SSEError
+
+        provider = self._make_provider_with_tokens()
+        request = self._make_request()
+
+        # SSE lines containing an error event
+        error_lines = [
+            "data: "
+            + json.dumps(
+                {
+                    "type": "error",
+                    "error": {
+                        "message": "Something went wrong",
+                        "code": "server_error",
+                    },
+                }
+            ),
+            "data: [DONE]",
+        ]
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(error_lines)
+            with pytest.raises(SSEError):
+                await provider.complete(request)  # type: ignore[union-attr]
+
+        coordinator = provider._coordinator  # type: ignore[union-attr]
+        calls = coordinator.hooks.emit.call_args_list
+        error_response_calls = [
+            c
+            for c in calls
+            if c.args[0] == "llm:response" and c.args[1].get("status") == "error"
+        ]
+        assert len(error_response_calls) >= 1, (
+            "Expected at least one llm:response event with status='error'"
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_tokens_raises_value_error(self) -> None:
+        """Provider with no valid tokens raises ValueError before making any HTTP request."""
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        coordinator = MagicMock()
+        coordinator.hooks.emit = AsyncMock()
+        provider = ChatGPTProvider({"default_model": "gpt-4o"}, coordinator, tokens=None)
+        request = self._make_request()
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.oauth.load_tokens",
+            return_value=None,
+        ):
+            with pytest.raises(ValueError):
+                await provider.complete(request)  # type: ignore[union-attr]
