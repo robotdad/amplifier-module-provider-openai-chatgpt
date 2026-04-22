@@ -6,6 +6,7 @@ against the ChatGPT backend API with OAuth authentication.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -13,9 +14,11 @@ from amplifier_core import ModelInfo, ProviderInfo
 from amplifier_core.message_models import (
     ChatRequest,
     ChatResponse,
-    TextBlock,  # noqa: F401 — used in complete() implementation
+    TextBlock,
+    ThinkingBlock,
     ToolCall,
-    ToolCallBlock,  # noqa: F401 — used in complete() implementation
+    ToolCallBlock,
+    ToolResultBlock,
     Usage,  # noqa: F401 — used in complete() implementation
 )
 from amplifier_core.utils import redact_secrets  # noqa: F401 — used in complete() implementation
@@ -145,6 +148,168 @@ class ChatGPTProvider:
                 )
             )
         return result
+
+    # ------------------------------------------------------------------
+    # Payload construction
+    # ------------------------------------------------------------------
+
+    def _convert_content(self, content: str | list[Any]) -> list[dict[str, Any]]:
+        """Convert Amplifier message content to Responses API input_text format.
+
+        - str → [{type: input_text, text}]
+        - TextBlock → {type: input_text, text}
+        - ThinkingBlock → {type: input_text, text: block.thinking}
+        - Other block types (ToolCallBlock, ToolResultBlock) are skipped here
+          and handled directly in _build_payload.
+        """
+        if isinstance(content, str):
+            return [{"type": "input_text", "text": content}]
+
+        result: list[dict[str, Any]] = []
+        for block in content:
+            if isinstance(block, TextBlock):
+                result.append({"type": "input_text", "text": block.text})
+            elif isinstance(block, ThinkingBlock):
+                result.append({"type": "input_text", "text": block.thinking})
+            # ToolCallBlock and ToolResultBlock are handled in _build_payload
+        return result
+
+    def _build_payload(self, request: ChatRequest) -> dict[str, Any]:
+        """Build Responses API payload from an Amplifier ChatRequest.
+
+        Key rules enforced:
+        - Uses ``input`` array (not ``messages``)
+        - First system/developer message → top-level ``instructions``
+        - ``stream: True`` and ``store: False`` are mandatory
+        - Rejected params (max_output_tokens, temperature, truncation,
+          parallel_tool_calls, include) are never included
+        - ``-fast`` model suffix → strip suffix + ``service_tier: 'priority'``
+        - request.model overrides default_model
+        - Tools → {type, name, description, parameters} + tool_choice: 'auto'
+        - ToolResultBlock → {type: function_call_output, call_id, output}
+        - ToolCallBlock → {type: function_call, call_id, name, arguments}
+        - Reasoning effort → {reasoning: {effort, summary: 'detailed'}}
+        """
+        # Resolve model (request overrides provider default)
+        model: str = request.model or self.default_model
+
+        # Handle -fast suffix → priority service tier
+        service_tier: str | None = None
+        if model.endswith("-fast"):
+            model = model.removesuffix("-fast")
+            service_tier = "priority"
+
+        # Build input array and extract instructions from system/developer message
+        instructions: str | None = None
+        input_items: list[dict[str, Any]] = []
+
+        for message in request.messages:
+            # First system/developer message becomes top-level instructions
+            if message.role in ("system", "developer") and instructions is None:
+                if isinstance(message.content, str):
+                    instructions = message.content
+                else:
+                    texts = [
+                        block.text
+                        for block in message.content
+                        if isinstance(block, TextBlock)
+                    ]
+                    instructions = " ".join(texts) if texts else ""
+                continue  # Do not add to input array
+
+            if message.role == "assistant":
+                if isinstance(message.content, list):
+                    # Split mixed content: text blocks go in role message,
+                    # tool call blocks become standalone function_call items
+                    text_parts: list[dict[str, Any]] = []
+                    for block in message.content:
+                        if isinstance(block, ToolCallBlock):
+                            input_items.append(
+                                {
+                                    "type": "function_call",
+                                    "call_id": block.id,
+                                    "name": block.name,
+                                    "arguments": json.dumps(block.input),
+                                }
+                            )
+                        elif isinstance(block, TextBlock):
+                            text_parts.append(
+                                {"type": "input_text", "text": block.text}
+                            )
+                        elif isinstance(block, ThinkingBlock):
+                            text_parts.append(
+                                {"type": "input_text", "text": block.thinking}
+                            )
+                    if text_parts:
+                        input_items.append({"role": "assistant", "content": text_parts})
+                else:
+                    input_items.append(
+                        {
+                            "role": "assistant",
+                            "content": self._convert_content(message.content),
+                        }
+                    )
+
+            elif message.role == "tool":
+                # Tool result messages → standalone function_call_output items
+                if isinstance(message.content, list):
+                    for block in message.content:
+                        if isinstance(block, ToolResultBlock):
+                            output = block.output
+                            if not isinstance(output, str):
+                                output = json.dumps(output)
+                            input_items.append(
+                                {
+                                    "type": "function_call_output",
+                                    "call_id": block.tool_call_id,
+                                    "output": output,
+                                }
+                            )
+
+            else:
+                # user, developer (additional after first), function
+                input_items.append(
+                    {
+                        "role": message.role,
+                        "content": self._convert_content(message.content),
+                    }
+                )
+
+        # Assemble base payload (no rejected params)
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": input_items,
+            "stream": True,
+            "store": False,
+        }
+
+        if instructions is not None:
+            payload["instructions"] = instructions
+
+        if service_tier is not None:
+            payload["service_tier"] = service_tier
+
+        # Tools → Responses API format
+        if request.tools:
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                }
+                for tool in request.tools
+            ]
+            payload["tool_choice"] = "auto"
+
+        # Reasoning effort
+        if request.reasoning_effort:
+            payload["reasoning"] = {
+                "effort": request.reasoning_effort,
+                "summary": "detailed",
+            }
+
+        return payload
 
     async def complete(self, request: ChatRequest) -> ChatResponse:
         """Send a completion request. Not yet implemented."""
