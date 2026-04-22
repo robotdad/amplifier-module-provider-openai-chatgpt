@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import pytest
 from unittest.mock import MagicMock
 
 # ---------------------------------------------------------------------------
@@ -507,3 +508,101 @@ class TestBuildPayload:
         request = self._make_request(messages=[Message(role="user", content="hi")])
         payload = provider._build_payload(request)  # type: ignore[union-attr]
         assert "reasoning" not in payload
+
+
+# ---------------------------------------------------------------------------
+# TestBuildHeaders — provider._build_headers()
+# ---------------------------------------------------------------------------
+
+
+class TestBuildHeaders:
+    def _make_provider(
+        self, tokens: dict | None = None, config: dict | None = None
+    ) -> object:
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        if config is None:
+            config = {}
+        coordinator = MagicMock()
+        return ChatGPTProvider(config, coordinator, tokens)
+
+    def _valid_tokens(self) -> dict:
+        return {"access_token": "test-access-tok", "account_id": "acct-123"}
+
+    # ------------------------------------------------------------------
+    # Happy path: all 6 required headers present with correct values
+    # ------------------------------------------------------------------
+
+    def test_authorization_header(self) -> None:
+        """Authorization header must be 'Bearer {access_token}'."""
+        provider = self._make_provider(tokens=self._valid_tokens())
+        headers = provider._build_headers()  # type: ignore[union-attr]
+        assert headers["Authorization"] == "Bearer test-access-tok"
+
+    def test_chatgpt_account_id_header(self) -> None:
+        """ChatGPT-Account-Id header must equal account_id from tokens."""
+        provider = self._make_provider(tokens=self._valid_tokens())
+        headers = provider._build_headers()  # type: ignore[union-attr]
+        assert headers["ChatGPT-Account-Id"] == "acct-123"
+
+    def test_openai_beta_header(self) -> None:
+        """OpenAI-Beta header must be 'responses=v1'."""
+        provider = self._make_provider(tokens=self._valid_tokens())
+        headers = provider._build_headers()  # type: ignore[union-attr]
+        assert headers["OpenAI-Beta"] == "responses=v1"
+
+    def test_openai_originator_header(self) -> None:
+        """OpenAI-Originator header must be 'codex'."""
+        provider = self._make_provider(tokens=self._valid_tokens())
+        headers = provider._build_headers()  # type: ignore[union-attr]
+        assert headers["OpenAI-Originator"] == "codex"
+
+    def test_content_type_header(self) -> None:
+        """Content-Type header must be 'application/json'."""
+        provider = self._make_provider(tokens=self._valid_tokens())
+        headers = provider._build_headers()  # type: ignore[union-attr]
+        assert headers["Content-Type"] == "application/json"
+
+    def test_accept_header(self) -> None:
+        """accept header must be 'text/event-stream'."""
+        provider = self._make_provider(tokens=self._valid_tokens())
+        headers = provider._build_headers()  # type: ignore[union-attr]
+        assert headers["accept"] == "text/event-stream"
+
+    def test_all_six_fields_present(self) -> None:
+        """Headers dict must have exactly the 6 required fields."""
+        provider = self._make_provider(tokens=self._valid_tokens())
+        headers = provider._build_headers()  # type: ignore[union-attr]
+        expected_keys = {
+            "Authorization",
+            "ChatGPT-Account-Id",
+            "OpenAI-Beta",
+            "OpenAI-Originator",
+            "Content-Type",
+            "accept",
+        }
+        assert set(headers.keys()) == expected_keys
+
+    # ------------------------------------------------------------------
+    # Error cases
+    # ------------------------------------------------------------------
+
+    def test_missing_access_token_raises_value_error(self) -> None:
+        """Missing access_token raises ValueError with 'No valid OAuth tokens'."""
+        tokens = {"account_id": "acct-123"}  # no access_token
+        provider = self._make_provider(tokens=tokens)
+        with pytest.raises(ValueError, match="No valid OAuth tokens"):
+            provider._build_headers()  # type: ignore[union-attr]
+
+    def test_none_tokens_raises_value_error(self) -> None:
+        """tokens=None raises ValueError with 'No valid OAuth tokens'."""
+        provider = self._make_provider(tokens=None)
+        with pytest.raises(ValueError, match="No valid OAuth tokens"):
+            provider._build_headers()  # type: ignore[union-attr]
+
+    def test_missing_account_id_raises_value_error(self) -> None:
+        """Missing account_id raises ValueError mentioning 'account_id'."""
+        tokens = {"access_token": "test-access-tok"}  # no account_id
+        provider = self._make_provider(tokens=tokens)
+        with pytest.raises(ValueError, match="account_id"):
+            provider._build_headers()  # type: ignore[union-attr]

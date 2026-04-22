@@ -311,6 +311,79 @@ class ChatGPTProvider:
 
         return payload
 
+    # ------------------------------------------------------------------
+    # Auth helpers
+    # ------------------------------------------------------------------
+
+    def _build_headers(self) -> dict[str, str]:
+        """Return the HTTP headers required for the ChatGPT Codex API.
+
+        Reads ``access_token`` and ``account_id`` from ``self._tokens``.
+
+        Returns:
+            Dict with six required headers.
+
+        Raises:
+            ValueError: If ``access_token`` is absent or ``_tokens`` is None.
+            ValueError: If ``account_id`` is absent.
+        """
+        if not self._tokens or not self._tokens.get("access_token"):
+            raise ValueError("No valid OAuth tokens available")
+
+        account_id = self._tokens.get("account_id")
+        if not account_id:
+            raise ValueError("No account_id in tokens — cannot build request headers")
+
+        return {
+            "Authorization": f"Bearer {self._tokens['access_token']}",
+            "ChatGPT-Account-Id": account_id,
+            "OpenAI-Beta": "responses=v1",
+            "OpenAI-Originator": "codex",
+            "Content-Type": "application/json",
+            "accept": "text/event-stream",
+        }
+
+    async def _ensure_valid_tokens(self) -> None:
+        """Guarantee ``self._tokens`` holds a valid, unexpired access token.
+
+        Resolution order:
+        1. In-memory tokens pass ``is_token_valid()`` → done.
+        2. Tokens loaded from disk pass ``is_token_valid()`` → update in-memory, done.
+        3. Refresh using in-memory ``refresh_token`` → update in-memory, done.
+        4. Refresh using disk ``refresh_token`` → update in-memory, done.
+        5. None of the above succeeded → raise ``ValueError``.
+
+        Raises:
+            ValueError: If no valid tokens can be obtained by any means.
+        """
+        # 1. In-memory tokens still valid.
+        if is_token_valid(self._tokens):
+            return
+
+        # 2. Fresh load from disk.
+        disk_tokens = load_tokens()
+        if is_token_valid(disk_tokens):
+            self._tokens = disk_tokens
+            return
+
+        # 3. Refresh using in-memory refresh_token.
+        if self._tokens and self._tokens.get("refresh_token"):
+            refreshed = await refresh_tokens(self._tokens["refresh_token"])
+            if refreshed:
+                self._tokens = refreshed
+                return
+
+        # 4. Refresh using disk refresh_token (different from in-memory).
+        if disk_tokens and disk_tokens.get("refresh_token"):
+            refreshed = await refresh_tokens(disk_tokens["refresh_token"])
+            if refreshed:
+                self._tokens = refreshed
+                return
+
+        raise ValueError(
+            "No valid OAuth tokens available — please run the login flow again"
+        )
+
     async def complete(self, request: ChatRequest) -> ChatResponse:
         """Send a completion request. Not yet implemented."""
         raise NotImplementedError(
