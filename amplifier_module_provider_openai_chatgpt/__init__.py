@@ -58,8 +58,10 @@ async def mount(
         if login_on_mount:
             try:
                 tokens = await login(token_file_path=token_file_path)
-            except Exception:
-                logger.warning("ChatGPT OAuth login failed during mount")
+            except Exception as exc:
+                logger.warning(
+                    "ChatGPT OAuth login failed during mount: %s", exc, exc_info=True
+                )
                 return None
         else:
             return None

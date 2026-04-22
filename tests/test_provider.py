@@ -120,42 +120,48 @@ class TestListModels:
         tokens: dict | None = None
         return ChatGPTProvider(config, coordinator, tokens)
 
-    def test_list_models_correct_count(self) -> None:
+    @pytest.mark.asyncio
+    async def test_list_models_correct_count(self) -> None:
         from amplifier_module_provider_openai_chatgpt.provider import CHATGPT_MODELS
 
         provider = self._make_provider()
-        models = provider.list_models()  # type: ignore[union-attr]
+        models = await provider.list_models()  # type: ignore[union-attr]
         assert len(models) == len(CHATGPT_MODELS)
 
-    def test_list_models_all_have_id(self) -> None:
+    @pytest.mark.asyncio
+    async def test_list_models_all_have_id(self) -> None:
         provider = self._make_provider()
-        models = provider.list_models()  # type: ignore[union-attr]
+        models = await provider.list_models()  # type: ignore[union-attr]
         for m in models:
             assert m.id, f"Model missing id: {m}"
 
-    def test_list_models_all_have_display_name(self) -> None:
+    @pytest.mark.asyncio
+    async def test_list_models_all_have_display_name(self) -> None:
         provider = self._make_provider()
-        models = provider.list_models()  # type: ignore[union-attr]
+        models = await provider.list_models()  # type: ignore[union-attr]
         for m in models:
             assert m.display_name, f"Model missing display_name: {m}"
 
-    def test_list_models_all_have_context_window(self) -> None:
+    @pytest.mark.asyncio
+    async def test_list_models_all_have_context_window(self) -> None:
         provider = self._make_provider()
-        models = provider.list_models()  # type: ignore[union-attr]
+        models = await provider.list_models()  # type: ignore[union-attr]
         for m in models:
             assert m.context_window > 0, f"Model missing context_window: {m}"
 
-    def test_list_models_all_have_max_output_tokens(self) -> None:
+    @pytest.mark.asyncio
+    async def test_list_models_all_have_max_output_tokens(self) -> None:
         provider = self._make_provider()
-        models = provider.list_models()  # type: ignore[union-attr]
+        models = await provider.list_models()  # type: ignore[union-attr]
         for m in models:
             assert m.max_output_tokens > 0, f"Model missing max_output_tokens: {m}"
 
-    def test_list_models_returns_model_info_objects(self) -> None:
+    @pytest.mark.asyncio
+    async def test_list_models_returns_model_info_objects(self) -> None:
         from amplifier_core import ModelInfo
 
         provider = self._make_provider()
-        models = provider.list_models()  # type: ignore[union-attr]
+        models = await provider.list_models()  # type: ignore[union-attr]
         for m in models:
             assert isinstance(m, ModelInfo), f"Expected ModelInfo, got {type(m)}"
 
@@ -1067,7 +1073,7 @@ class TestComplete:
         calls = coordinator.hooks.emit.call_args_list
         request_calls = [c for c in calls if c.args[0] == "llm:request"]
         event_data = request_calls[0].args[1]
-        assert "payload" in event_data
+        assert "raw" in event_data
 
     @pytest.mark.asyncio
     async def test_raw_mode_response_event_includes_raw_events(self) -> None:
@@ -1086,7 +1092,7 @@ class TestComplete:
         calls = coordinator.hooks.emit.call_args_list
         response_calls = [c for c in calls if c.args[0] == "llm:response"]
         event_data = response_calls[0].args[1]
-        assert "raw_events" in event_data
+        assert "raw" in event_data
 
     @pytest.mark.asyncio
     async def test_non_raw_mode_request_no_payload(self) -> None:
@@ -1215,6 +1221,8 @@ class TestMount:
         from amplifier_module_provider_openai_chatgpt import mount
 
         coordinator = MagicMock()
+        # coordinator.mount is awaited in __init__.py, so it must be an AsyncMock
+        coordinator.mount = AsyncMock()
         expires_at = (datetime.now(tz=timezone.utc) + timedelta(hours=1)).isoformat()
         valid_tokens = {
             "access_token": "test-access-token",

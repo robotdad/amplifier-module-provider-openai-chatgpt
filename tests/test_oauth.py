@@ -3,14 +3,14 @@
 import asyncio
 import base64
 import hashlib
-import io
 import json
 import os
 import re
 from datetime import datetime, timedelta, timezone
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-from urllib.error import HTTPError
+
+import httpx
+import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -37,21 +37,45 @@ def _make_jwt(payload_dict: dict) -> str:
     return f"{header}.{payload}."
 
 
-def _mock_urlopen_response(body_dict: dict) -> MagicMock:
-    """Return a mock urlopen callable that yields the given JSON response body.
+def _make_httpx_mock(*post_responses):
+    """Return a mock for patching httpx.AsyncClient with sequenced POST responses.
 
-    Usage::
+    Each positional argument is either:
+    - dict  → successful response; resp.json() returns that dict, raise_for_status() is a no-op
+    - Exception → raised when resp.raise_for_status() is called
 
-        mock_urlopen = _mock_urlopen_response({"access_token": "tok"})
-        with patch("...urlopen", mock_urlopen):
-            ...
+    All calls to httpx.AsyncClient() share the same mock client instance,
+    and each successive call to client.post() consumes the next response spec.
     """
-    body = json.dumps(body_dict).encode("utf-8")
-    mock_response = MagicMock()
-    mock_response.read.return_value = body
-    mock_response.__enter__.return_value = mock_response
-    mock_response.__exit__.return_value = False
-    return MagicMock(return_value=mock_response)
+    resp_mocks = []
+    for spec in post_responses:
+        mock_resp = MagicMock()
+        if isinstance(spec, Exception):
+            mock_resp.raise_for_status.side_effect = spec
+        else:
+            mock_resp.raise_for_status = MagicMock()  # no-op for success
+            mock_resp.json.return_value = spec
+        resp_mocks.append(mock_resp)
+
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(side_effect=resp_mocks)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    return MagicMock(return_value=mock_client)
+
+
+def _make_httpx_status_error(
+    body_dict: dict, status_code: int = 403
+) -> httpx.HTTPStatusError:
+    """Create an httpx.HTTPStatusError with a JSON body, as device code poll errors arrive."""
+    from amplifier_module_provider_openai_chatgpt.oauth import DEVICE_CODE_TOKEN_URL
+
+    request = httpx.Request("POST", DEVICE_CODE_TOKEN_URL)
+    response = httpx.Response(status_code=status_code, json=body_dict, request=request)
+    return httpx.HTTPStatusError(
+        f"HTTP {status_code}", request=request, response=response
+    )
 
 
 class TestConstants:
@@ -166,6 +190,14 @@ class TestConstants:
 
         assert not hasattr(oauth_module, "start_browser_flow"), (
             "start_browser_flow should have been removed"
+        )
+
+    def test_no_is_ssh_session(self):
+        """_is_ssh_session() must not exist (dead code, removed)."""
+        import amplifier_module_provider_openai_chatgpt.oauth as oauth_module
+
+        assert not hasattr(oauth_module, "_is_ssh_session"), (
+            "_is_ssh_session should have been removed as dead code"
         )
 
 
@@ -349,23 +381,26 @@ class TestRefreshTokens:
     """Verify refresh_tokens() HTTP behavior."""
 
     def test_successful_refresh_returns_new_tokens_with_account_id(self, tmp_path):
+        """account_id falls back to disk when id_token is absent from the response."""
         from amplifier_module_provider_openai_chatgpt.oauth import refresh_tokens
 
-        # Write existing tokens so that refresh_tokens can preserve account_id.
+        # Write existing tokens so that refresh_tokens can fall back to account_id.
         token_path = str(tmp_path / "tokens.json")
         with open(token_path, "w") as f:
             json.dump({"account_id": "existing_acc", "access_token": "old"}, f)
 
-        mock_urlopen = _mock_urlopen_response(
+        mock_async_client = _make_httpx_mock(
             {
                 "access_token": "new_access",
                 "refresh_token": "new_refresh",
                 "expires_in": 3600,
+                # no id_token in response — should fall back to disk account_id
             }
         )
 
         with patch(
-            "amplifier_module_provider_openai_chatgpt.oauth.urlopen", mock_urlopen
+            "amplifier_module_provider_openai_chatgpt.oauth.httpx.AsyncClient",
+            mock_async_client,
         ):
             result = asyncio.run(refresh_tokens("test_refresh", path=token_path))
 
@@ -374,54 +409,59 @@ class TestRefreshTokens:
         assert result["access_token"] == "new_access"
         assert result["account_id"] == "existing_acc"
 
-    def test_refresh_failure_http_401_returns_none(self, tmp_path):
+    def test_account_id_extracted_from_id_token_on_refresh(self, tmp_path):
+        """account_id is read from the new id_token JWT when present in the response."""
         from amplifier_module_provider_openai_chatgpt.oauth import refresh_tokens
 
-        mock_urlopen = MagicMock(
-            side_effect=HTTPError(
-                url="https://auth.openai.com/oauth/token",
-                code=401,
-                msg="Unauthorized",
-                hdrs={},  # type: ignore[arg-type]
-                fp=io.BytesIO(b"Unauthorized"),
-            )
+        token_path = str(tmp_path / "tokens.json")
+        # Old disk tokens have a stale account_id — the id_token should win.
+        with open(token_path, "w") as f:
+            json.dump({"account_id": "stale_acc", "access_token": "old"}, f)
+
+        id_token_jwt = _make_jwt(
+            {"https://api.openai.com/profile": {"account_id": "fresh_acc"}}
+        )
+        mock_async_client = _make_httpx_mock(
+            {
+                "access_token": "new_access",
+                "refresh_token": "new_refresh",
+                "id_token": id_token_jwt,
+                "expires_in": 3600,
+            }
         )
 
         with patch(
-            "amplifier_module_provider_openai_chatgpt.oauth.urlopen", mock_urlopen
+            "amplifier_module_provider_openai_chatgpt.oauth.httpx.AsyncClient",
+            mock_async_client,
+        ):
+            result = asyncio.run(refresh_tokens("test_refresh", path=token_path))
+
+        assert result is not None
+        assert result["account_id"] == "fresh_acc"
+
+    def test_refresh_failure_http_401_returns_none(self, tmp_path):
+        """HTTP error during refresh causes refresh_tokens to return None."""
+        from amplifier_module_provider_openai_chatgpt.oauth import refresh_tokens
+
+        from amplifier_module_provider_openai_chatgpt.oauth import OAUTH_TOKEN_URL
+
+        request = httpx.Request("POST", OAUTH_TOKEN_URL)
+        response = httpx.Response(401, content=b"Unauthorized", request=request)
+        status_error = httpx.HTTPStatusError(
+            "401 Unauthorized", request=request, response=response
+        )
+
+        mock_async_client = _make_httpx_mock(status_error)
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.oauth.httpx.AsyncClient",
+            mock_async_client,
         ):
             result = asyncio.run(
                 refresh_tokens("bad_refresh", path=str(tmp_path / "tokens.json"))
             )
 
         assert result is None
-
-
-def _make_http_error(body_dict: dict, code: int = 403) -> HTTPError:
-    """Create an HTTPError with a JSON body for testing.
-
-    Device code polling pending/expired responses arrive as HTTP errors
-    (403/404), NOT as 200 OK responses.  Use this helper to build those
-    errors in tests.
-    """
-    body = json.dumps(body_dict).encode("utf-8")
-    return HTTPError(
-        url="https://auth.openai.com/api/accounts/deviceauth/token",
-        code=code,
-        msg="Error",
-        hdrs={},  # type: ignore[arg-type]
-        fp=io.BytesIO(body),
-    )
-
-
-def _make_urlopen_cm(body_dict: dict) -> MagicMock:
-    """Create a context-manager mock that urlopen returns for a successful call."""
-    body = json.dumps(body_dict).encode("utf-8")
-    mock_cm = MagicMock()
-    mock_cm.read.return_value = body
-    mock_cm.__enter__.return_value = mock_cm
-    mock_cm.__exit__.return_value = False
-    return mock_cm
 
 
 class TestDeviceCodeFlow:
@@ -432,15 +472,17 @@ class TestDeviceCodeFlow:
             start_device_code_flow,
         )
 
-        usercode_cm = _make_urlopen_cm(
-            {"user_code": "ABC-123", "device_auth_id": "dev_001", "interval": 5}
+        mock_async_client = _make_httpx_mock(
+            # Step 1: usercode endpoint response
+            {"user_code": "ABC-123", "device_auth_id": "dev_001", "interval": 5},
+            # Poll 1: success
+            {"authorization_code": "auth_code_xyz"},
         )
-        poll_success_cm = _make_urlopen_cm({"authorization_code": "auth_code_xyz"})
-        mock_urlopen = MagicMock(side_effect=[usercode_cm, poll_success_cm])
 
         with (
             patch(
-                "amplifier_module_provider_openai_chatgpt.oauth.urlopen", mock_urlopen
+                "amplifier_module_provider_openai_chatgpt.oauth.httpx.AsyncClient",
+                mock_async_client,
             ),
             patch("asyncio.sleep", new_callable=AsyncMock),
         ):
@@ -455,24 +497,22 @@ class TestDeviceCodeFlow:
             start_device_code_flow,
         )
 
-        usercode_cm = _make_urlopen_cm(
-            {"user_code": "ABC-123", "device_auth_id": "dev_001", "interval": 5}
-        )
-        poll_success_cm = _make_urlopen_cm({"authorization_code": "auth_code_xyz"})
-        mock_urlopen = MagicMock(
-            side_effect=[
-                usercode_cm,
-                _make_http_error(
-                    {"error": {"code": "deviceauth_authorization_unknown"}}
-                ),
-                poll_success_cm,
-            ]
+        mock_async_client = _make_httpx_mock(
+            # Step 1: usercode endpoint response
+            {"user_code": "ABC-123", "device_auth_id": "dev_001", "interval": 5},
+            # Poll 1: authorization still pending (arrives as 4xx)
+            _make_httpx_status_error(
+                {"error": {"code": "deviceauth_authorization_unknown"}}
+            ),
+            # Poll 2: success
+            {"authorization_code": "auth_code_xyz"},
         )
         mock_sleep = AsyncMock()
 
         with (
             patch(
-                "amplifier_module_provider_openai_chatgpt.oauth.urlopen", mock_urlopen
+                "amplifier_module_provider_openai_chatgpt.oauth.httpx.AsyncClient",
+                mock_async_client,
             ),
             patch("asyncio.sleep", mock_sleep),
         ):
@@ -486,21 +526,89 @@ class TestDeviceCodeFlow:
             start_device_code_flow,
         )
 
-        usercode_cm = _make_urlopen_cm(
-            {"user_code": "ABC-123", "device_auth_id": "dev_001", "interval": 5}
-        )
-        mock_urlopen = MagicMock(
-            side_effect=[
-                usercode_cm,
-                _make_http_error({"error": {"code": "deviceauth_expired"}}),
-            ]
+        mock_async_client = _make_httpx_mock(
+            # Step 1: usercode endpoint response
+            {"user_code": "ABC-123", "device_auth_id": "dev_001", "interval": 5},
+            # Poll 1: device code expired
+            _make_httpx_status_error({"error": {"code": "deviceauth_expired"}}),
         )
 
         with (
             patch(
-                "amplifier_module_provider_openai_chatgpt.oauth.urlopen", mock_urlopen
+                "amplifier_module_provider_openai_chatgpt.oauth.httpx.AsyncClient",
+                mock_async_client,
             ),
             patch("asyncio.sleep", new_callable=AsyncMock),
         ):
             with pytest.raises(RuntimeError, match="Device code expired"):
                 asyncio.run(start_device_code_flow())
+
+
+class TestLogin:
+    """Verify login() orchestration, especially the direct-tokens path."""
+
+    def test_expires_at_computed_from_expires_in_on_direct_token_path(self, tmp_path):
+        """When tokens arrive directly (no code exchange), expires_at must be computed
+        from expires_in, never left as an empty string."""
+        from amplifier_module_provider_openai_chatgpt.oauth import login
+
+        id_jwt = _make_jwt({"sub": "user_sub"})
+        direct_tokens_result = {
+            "tokens_direct": True,
+            "access_token": "direct_access",
+            "refresh_token": "direct_refresh",
+            "id_token": id_jwt,
+            "expires_in": 7200,
+            # intentionally NO expires_at key — must be computed from expires_in
+        }
+
+        token_path = str(tmp_path / "tokens.json")
+        before = datetime.now(tz=timezone.utc)
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.oauth.start_device_code_flow",
+            new_callable=AsyncMock,
+            return_value=direct_tokens_result,
+        ):
+            result = asyncio.run(login(token_file_path=token_path))
+
+        after = datetime.now(tz=timezone.utc)
+
+        assert result["access_token"] == "direct_access"
+        assert result["expires_at"], "expires_at must not be empty"
+
+        # Verify the timestamp is plausible: between now+7200s ± a few seconds.
+        expiry = datetime.fromisoformat(result["expires_at"])
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        assert expiry >= before + timedelta(seconds=7190), (
+            f"expires_at {expiry} should be ~2h in the future"
+        )
+        assert expiry <= after + timedelta(seconds=7210), (
+            f"expires_at {expiry} is unexpectedly far in the future"
+        )
+
+    def test_direct_token_path_uses_server_expires_at_when_provided(self, tmp_path):
+        """When the server supplies expires_at, it takes precedence over computed value."""
+        from amplifier_module_provider_openai_chatgpt.oauth import login
+
+        server_expires_at = "2099-12-31T23:59:59+00:00"
+        direct_tokens_result = {
+            "tokens_direct": True,
+            "access_token": "direct_access",
+            "refresh_token": "direct_refresh",
+            "id_token": "",
+            "expires_in": 3600,
+            "expires_at": server_expires_at,
+        }
+
+        token_path = str(tmp_path / "tokens.json")
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.oauth.start_device_code_flow",
+            new_callable=AsyncMock,
+            return_value=direct_tokens_result,
+        ):
+            result = asyncio.run(login(token_file_path=token_path))
+
+        assert result["expires_at"] == server_expires_at

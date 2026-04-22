@@ -13,7 +13,8 @@ import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -182,13 +183,16 @@ async def refresh_tokens(refresh_token: str, path: str | None = None) -> dict | 
         }
     ).encode("utf-8")
 
-    req = Request(OAUTH_TOKEN_URL, data=data, method="POST")
-    req.add_header("User-Agent", "amplifier-openai-chatgpt-provider/1.0")
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    headers = {
+        "User-Agent": "amplifier-openai-chatgpt-provider/1.0",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
 
     try:
-        with urlopen(req) as response:
-            token_data = json.loads(response.read())
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(OAUTH_TOKEN_URL, content=data, headers=headers)
+            resp.raise_for_status()
+            token_data = resp.json()
     except Exception as exc:
         logger.warning("Failed to refresh tokens: %s", exc)
         return None
@@ -199,9 +203,15 @@ async def refresh_tokens(refresh_token: str, path: str | None = None) -> dict | 
         datetime.now(tz=timezone.utc) + timedelta(seconds=expires_in)
     ).isoformat()
 
-    # Preserve account_id from any existing tokens stored on disk.
-    existing = load_tokens(path)
-    account_id = existing.get("account_id") if existing else None
+    # Extract account_id from the new id_token if present.
+    account_id = None
+    if "id_token" in token_data:
+        account_id = extract_account_id(token_data["id_token"]) or None
+
+    # Fall back: preserve account_id from any existing tokens stored on disk.
+    if not account_id:
+        existing = load_tokens(path)
+        account_id = existing.get("account_id") if existing else None
 
     result = {
         "auth_mode": "oauth",
@@ -257,18 +267,21 @@ async def exchange_code_for_tokens(
         }
     ).encode("utf-8")
 
-    req = Request(OAUTH_TOKEN_URL, data=data, method="POST")
-    req.add_header("User-Agent", "amplifier-openai-chatgpt-provider/1.0")
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
-
-    from urllib.error import HTTPError as _HTTPError
+    headers = {
+        "User-Agent": "amplifier-openai-chatgpt-provider/1.0",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
 
     try:
-        with urlopen(req) as response:
-            token_data = json.loads(response.read())
-    except _HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")[:500]
-        raise RuntimeError(f"Token exchange failed (HTTP {exc.code}): {body}") from exc
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(OAUTH_TOKEN_URL, content=data, headers=headers)
+            resp.raise_for_status()
+            token_data = resp.json()
+    except httpx.HTTPStatusError as exc:
+        body = exc.response.text[:500]
+        raise RuntimeError(
+            f"Token exchange failed (HTTP {exc.response.status_code}): {body}"
+        ) from exc
 
     id_token = token_data.get("id_token", "")
     account_id = extract_account_id(id_token)
@@ -411,11 +424,16 @@ async def start_device_code_flow() -> dict:
         }
     ).encode("utf-8")
 
-    req = Request(DEVICE_CODE_USERCODE_URL, data=data, method="POST")
-    req.add_header("User-Agent", "amplifier-openai-chatgpt-provider/1.0")
-    req.add_header("Content-Type", "application/json")
-    with urlopen(req) as response:
-        device_data = json.loads(response.read())
+    headers = {
+        "User-Agent": "amplifier-openai-chatgpt-provider/1.0",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            DEVICE_CODE_USERCODE_URL, content=data, headers=headers
+        )
+        resp.raise_for_status()
+        device_data = resp.json()
 
     user_code: str = device_data["user_code"]
     device_code: str = device_data.get("device_code") or device_data.get(
@@ -440,9 +458,12 @@ async def start_device_code_flow() -> dict:
     )
 
     # Step 3: Poll until authorized or an error occurs.
-    from urllib.error import HTTPError
-
     device_auth_id = device_data.get("device_auth_id", device_code)
+
+    poll_headers = {
+        "User-Agent": "amplifier-openai-chatgpt-provider/1.0",
+        "Content-Type": "application/json",
+    }
 
     while True:
         await asyncio.sleep(interval)
@@ -455,13 +476,13 @@ async def start_device_code_flow() -> dict:
             }
         ).encode("utf-8")
 
-        poll_req = Request(DEVICE_CODE_TOKEN_URL, data=poll_data, method="POST")
-        poll_req.add_header("User-Agent", "amplifier-openai-chatgpt-provider/1.0")
-        poll_req.add_header("Content-Type", "application/json")
-
         try:
-            with urlopen(poll_req) as response:
-                result = json.loads(response.read())
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    DEVICE_CODE_TOKEN_URL, content=poll_data, headers=poll_headers
+                )
+                resp.raise_for_status()
+                result = resp.json()
             # Success — return the authorization code and PKCE verifier.
             # The response may contain authorization_code (for token exchange)
             # or tokens directly (access_token, refresh_token).
@@ -475,8 +496,8 @@ async def start_device_code_flow() -> dict:
             else:
                 # Tokens returned directly — skip the exchange step.
                 return {"tokens_direct": True, **result}
-        except HTTPError as e:
-            body = json.loads(e.read().decode("utf-8", errors="replace"))
+        except httpx.HTTPStatusError as e:
+            body = e.response.json()
             error_code = body.get("error", {}).get("code", "")
 
             if error_code in (
@@ -496,11 +517,6 @@ async def start_device_code_flow() -> dict:
 # ---------------------------------------------------------------------------
 # Login orchestration (device code only)
 # ---------------------------------------------------------------------------
-
-
-def _is_ssh_session() -> bool:
-    """Detect if we're running inside an SSH session."""
-    return bool(os.environ.get("SSH_CLIENT") or os.environ.get("SSH_TTY"))
 
 
 async def login(*, token_file_path: str | None = None) -> dict:
@@ -541,14 +557,19 @@ async def login(*, token_file_path: str | None = None) -> dict:
                 result = task.result()
 
                 if result.get("tokens_direct"):
-                    # Device code flow returned tokens directly — save and return.
+                    # Device code flow returned tokens directly — compute expires_at
+                    # from expires_in so the token is never stored with an empty timestamp.
+                    expires_in = result.get("expires_in", 3600)
+                    expires_at = (
+                        datetime.now(tz=timezone.utc) + timedelta(seconds=expires_in)
+                    ).isoformat()
                     tokens = {
                         "auth_mode": "oauth",
                         "access_token": result.get("access_token", ""),
                         "refresh_token": result.get("refresh_token", ""),
                         "id_token": result.get("id_token", ""),
                         "account_id": extract_account_id(result.get("id_token", "")),
-                        "expires_at": result.get("expires_at", ""),
+                        "expires_at": result.get("expires_at") or expires_at,
                     }
                     save_tokens(tokens, token_file_path)
                     return tokens

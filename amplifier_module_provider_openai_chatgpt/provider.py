@@ -24,7 +24,7 @@ from amplifier_core.message_models import (
     ToolResultBlock,
     Usage,
 )
-from amplifier_core.utils import redact_secrets  # noqa: F401 — available for emit helpers
+from amplifier_core.utils import redact_secrets
 
 from ._sse import ParsedResponse, parse_sse_events
 from .oauth import (
@@ -109,9 +109,10 @@ class ChatGPTProvider:
         self.raw: bool = bool(self._config.get("raw", False))
         self.default_model: str = self._config.get("default_model", "gpt-4o")
         self.timeout: float = float(self._config.get("timeout", 300.0))
+        self._token_file_path: str | None = self._config.get("token_file_path")
 
-        # Lazy httpx client — created on first use
-        self._client: httpx.AsyncClient | None = None
+        # No persistent client — httpx.AsyncClient is created per-request in complete().
+        # This is intentional: token refresh may change headers between calls.
 
     # ------------------------------------------------------------------
     # Provider Protocol
@@ -122,10 +123,10 @@ class ChatGPTProvider:
         return ProviderInfo(
             id="openai-chatgpt",
             display_name="OpenAI ChatGPT",
-            capabilities=["streaming", "tools"],
+            capabilities=["streaming", "tools", "reasoning"],
         )
 
-    def list_models(self) -> list[ModelInfo]:
+    async def list_models(self) -> list[ModelInfo]:
         """Return ModelInfo objects for all known ChatGPT models."""
         return [
             ModelInfo(
@@ -137,43 +138,47 @@ class ChatGPTProvider:
             for entry in CHATGPT_MODELS
         ]
 
-    def parse_tool_calls(self, raw_calls: list[dict[str, Any]]) -> list[ToolCall]:
-        """Filter tool calls with non-None arguments and convert to ToolCall objects."""
-        result: list[ToolCall] = []
-        for call in raw_calls:
-            if call.get("arguments") is None:
-                continue
-            result.append(
-                ToolCall(
-                    id=call.get("id", ""),
-                    name=call.get("name", ""),
-                    arguments=call["arguments"],
-                )
-            )
-        return result
+    def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
+        """Parse tool calls from a ChatResponse.
+
+        Args:
+            response: Typed chat response containing tool_calls.
+
+        Returns:
+            List of ToolCall objects from the response, or [] if none present.
+        """
+        if not response.tool_calls:
+            return []
+        return list(response.tool_calls)
 
     # ------------------------------------------------------------------
     # Payload construction
     # ------------------------------------------------------------------
 
-    def _convert_content(self, content: str | list[Any]) -> list[dict[str, Any]]:
-        """Convert Amplifier message content to Responses API input_text format.
+    def _convert_content(
+        self, content: str | list[Any], role: str = "user"
+    ) -> list[dict[str, Any]]:
+        """Convert Amplifier message content to Responses API content format.
 
-        - str → [{type: input_text, text}]
-        - TextBlock → {type: input_text, text}
-        - ThinkingBlock → {type: input_text, text: block.thinking}
+        - str → [{type: input_text|output_text, text}]
+        - TextBlock → {type: input_text|output_text, text}
+        - ThinkingBlock → {type: input_text|output_text, text: block.thinking}
         - Other block types (ToolCallBlock, ToolResultBlock) are skipped here
           and handled directly in _build_payload.
+
+        Uses ``output_text`` when role is ``"assistant"``; ``input_text`` otherwise.
         """
+        text_type = "output_text" if role == "assistant" else "input_text"
+
         if isinstance(content, str):
-            return [{"type": "input_text", "text": content}]
+            return [{"type": text_type, "text": content}]
 
         result: list[dict[str, Any]] = []
         for block in content:
             if isinstance(block, TextBlock):
-                result.append({"type": "input_text", "text": block.text})
+                result.append({"type": text_type, "text": block.text})
             elif isinstance(block, ThinkingBlock):
-                result.append({"type": "input_text", "text": block.thinking})
+                result.append({"type": text_type, "text": block.thinking})
             # ToolCallBlock and ToolResultBlock are handled in _build_payload
         return result
 
@@ -237,11 +242,11 @@ class ChatGPTProvider:
                             )
                         elif isinstance(block, TextBlock):
                             text_parts.append(
-                                {"type": "input_text", "text": block.text}
+                                {"type": "output_text", "text": block.text}
                             )
                         elif isinstance(block, ThinkingBlock):
                             text_parts.append(
-                                {"type": "input_text", "text": block.thinking}
+                                {"type": "output_text", "text": block.thinking}
                             )
                     if text_parts:
                         input_items.append({"role": "assistant", "content": text_parts})
@@ -249,7 +254,9 @@ class ChatGPTProvider:
                     input_items.append(
                         {
                             "role": "assistant",
-                            "content": self._convert_content(message.content),
+                            "content": self._convert_content(
+                                message.content, role="assistant"
+                            ),
                         }
                     )
 
@@ -268,6 +275,14 @@ class ChatGPTProvider:
                                     "output": output,
                                 }
                             )
+                else:
+                    input_items.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": getattr(message, "tool_call_id", "unknown"),
+                            "output": str(message.content),
+                        }
+                    )
 
             else:
                 # user, developer (additional after first), function
@@ -347,10 +362,7 @@ class ChatGPTProvider:
         }
 
     async def close(self) -> None:
-        """Close the underlying HTTP client if it was created."""
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
+        """No-op — httpx clients are created per-request in complete()."""
 
     async def _ensure_valid_tokens(self) -> None:
         """Guarantee ``self._tokens`` holds a valid, unexpired access token.
@@ -370,21 +382,25 @@ class ChatGPTProvider:
             return
 
         # 2. Fresh load from disk.
-        disk_tokens = load_tokens()
+        disk_tokens = load_tokens(path=self._token_file_path)
         if is_token_valid(disk_tokens):
             self._tokens = disk_tokens
             return
 
         # 3. Refresh using in-memory refresh_token.
         if self._tokens and self._tokens.get("refresh_token"):
-            refreshed = await refresh_tokens(self._tokens["refresh_token"])
+            refreshed = await refresh_tokens(
+                self._tokens["refresh_token"], path=self._token_file_path
+            )
             if refreshed:
                 self._tokens = refreshed
                 return
 
         # 4. Refresh using disk refresh_token (different from in-memory).
         if disk_tokens and disk_tokens.get("refresh_token"):
-            refreshed = await refresh_tokens(disk_tokens["refresh_token"])
+            refreshed = await refresh_tokens(
+                disk_tokens["refresh_token"], path=self._token_file_path
+            )
             if refreshed:
                 self._tokens = refreshed
                 return
@@ -431,7 +447,7 @@ class ChatGPTProvider:
                 "message_count": len(request.messages),
             }
             if self.raw:
-                req_event["payload"] = payload
+                req_event["raw"] = redact_secrets(payload)
             await self._coordinator.hooks.emit("llm:request", req_event)
 
         start_time = time.monotonic()
@@ -474,7 +490,7 @@ class ChatGPTProvider:
                     "duration_ms": duration_ms,
                 }
                 if self.raw:
-                    resp_event["raw_events"] = parsed.raw_events
+                    resp_event["raw"] = redact_secrets({"events": parsed.raw_events})
                 await self._coordinator.hooks.emit("llm:response", resp_event)
 
             # 8. Return ChatResponse.

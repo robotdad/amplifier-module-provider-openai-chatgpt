@@ -9,6 +9,7 @@ authors = [
     { name = "Microsoft MADE:Explorations Team" },
 ]
 dependencies = [
+    "amplifier-core>=1.3.3",
     "httpx>=0.27.0",
 ]
 
