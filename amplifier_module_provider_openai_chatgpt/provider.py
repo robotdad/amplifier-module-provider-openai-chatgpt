@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING, Any
+import time
+from typing import Any
+
+import httpx
 
 from amplifier_core import ModelInfo, ProviderInfo
 from amplifier_core.message_models import (
@@ -19,22 +22,22 @@ from amplifier_core.message_models import (
     ToolCall,
     ToolCallBlock,
     ToolResultBlock,
-    Usage,  # noqa: F401 — used in complete() implementation
+    Usage,
 )
-from amplifier_core.utils import redact_secrets  # noqa: F401 — used in complete() implementation
+from amplifier_core.utils import redact_secrets  # noqa: F401 — available for emit helpers
 
-from ._sse import ParsedResponse, SSEError, parse_sse_events  # noqa: F401 — used in complete()
+from ._sse import ParsedResponse, parse_sse_events
 from .oauth import (
-    CHATGPT_CODEX_BASE_URL,  # noqa: F401 — used in complete() implementation
-    is_token_valid,  # noqa: F401 — used in complete() implementation
-    load_tokens,  # noqa: F401 — used in complete() implementation
-    refresh_tokens,  # noqa: F401 — used in complete() implementation
+    CHATGPT_CODEX_BASE_URL,
+    is_token_valid,
+    load_tokens,
+    refresh_tokens,
 )
-
-if TYPE_CHECKING:
-    import httpx
 
 logger = logging.getLogger(__name__)
+
+# Full endpoint for the ChatGPT Responses API
+CHATGPT_CODEX_ENDPOINT = CHATGPT_CODEX_BASE_URL + "/responses"
 
 # ---------------------------------------------------------------------------
 # Model catalog
@@ -384,8 +387,152 @@ class ChatGPTProvider:
             "No valid OAuth tokens available — please run the login flow again"
         )
 
-    async def complete(self, request: ChatRequest) -> ChatResponse:
-        """Send a completion request. Not yet implemented."""
-        raise NotImplementedError(
-            "complete() is not yet implemented for ChatGPTProvider"
+    async def complete(self, request: ChatRequest, **kwargs: Any) -> ChatResponse:
+        """Send a completion request to the ChatGPT Responses API.
+
+        Flow:
+        1. Ensure valid OAuth tokens.
+        2. Build request payload.
+        3. Emit ``llm:request`` event.
+        4. POST to CHATGPT_CODEX_ENDPOINT with httpx streaming, collect SSE lines.
+        5. Check HTTP status (non-200 raises ValueError).
+        6. Parse SSE events.
+        7. Emit ``llm:response`` event with usage and timing.
+        8. Return ChatResponse via ``_to_chat_response()``.
+
+        On any exception an ``llm:response`` event with ``status='error'`` is
+        emitted before re-raising.
+        """
+        # 1. Ensure valid OAuth tokens.
+        await self._ensure_valid_tokens()
+
+        # 2. Build request payload.
+        payload = self._build_payload(request)
+
+        # Resolve effective model name (mirrors _build_payload logic) for events.
+        model: str = request.model or self.default_model
+        if model.endswith("-fast"):
+            model = model.removesuffix("-fast")
+
+        headers = self._build_headers()
+
+        # 3. Emit llm:request event.
+        _has_hooks = self._coordinator and hasattr(self._coordinator, "hooks")
+        if _has_hooks:
+            req_event: dict[str, Any] = {
+                "provider": self.name,
+                "model": model,
+                "message_count": len(request.messages),
+            }
+            if self.raw:
+                req_event["payload"] = payload
+            await self._coordinator.hooks.emit("llm:request", req_event)
+
+        start_time = time.monotonic()
+
+        try:
+            # 4. POST with httpx streaming, collect SSE lines.
+            lines: list[str] = []
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                async with client.stream(
+                    "POST",
+                    CHATGPT_CODEX_ENDPOINT,
+                    json=payload,
+                    headers=headers,
+                ) as resp:
+                    # 5. Check HTTP status.
+                    if resp.status_code != 200:
+                        error_body = await resp.aread()
+                        raise ValueError(
+                            f"ChatGPT API error {resp.status_code}: "
+                            f"{error_body.decode(errors='replace')}"
+                        )
+                    async for line in resp.aiter_lines():
+                        lines.append(line)
+
+            # 6. Parse SSE events.
+            parsed = parse_sse_events(lines)
+
+            duration_ms = (time.monotonic() - start_time) * 1000
+
+            # 7. Emit llm:response event (success).
+            if _has_hooks:
+                resp_event: dict[str, Any] = {
+                    "provider": self.name,
+                    "model": model,
+                    "usage": {
+                        "input_tokens": parsed.input_tokens,
+                        "output_tokens": parsed.output_tokens,
+                    },
+                    "status": "ok",
+                    "duration_ms": duration_ms,
+                }
+                if self.raw:
+                    resp_event["raw_events"] = parsed.raw_events
+                await self._coordinator.hooks.emit("llm:response", resp_event)
+
+            # 8. Return ChatResponse.
+            return self._to_chat_response(parsed, model)
+
+        except Exception as exc:
+            duration_ms = (time.monotonic() - start_time) * 1000
+            if _has_hooks:
+                await self._coordinator.hooks.emit(
+                    "llm:response",
+                    {
+                        "provider": self.name,
+                        "model": model,
+                        "status": "error",
+                        "error": str(exc),
+                        "duration_ms": duration_ms,
+                    },
+                )
+            raise
+
+    def _to_chat_response(self, parsed: ParsedResponse, model: str) -> ChatResponse:
+        """Convert a ``ParsedResponse`` into an Amplifier ``ChatResponse``.
+
+        Text content → ``TextBlock``.
+        Tool calls → ``ToolCallBlock`` (in ``content``) + ``ToolCall`` (in
+        ``tool_calls``).  JSON arguments are parsed; malformed JSON falls back
+        to ``{"_raw": <original_string>}``.
+        ``finish_reason`` is ``"tool_calls"`` when tool calls are present,
+        otherwise ``"stop"``.
+        """
+        content_blocks: list[Any] = []
+        tool_call_list: list[ToolCall] = []
+
+        # Text content → TextBlock
+        if parsed.content:
+            content_blocks.append(TextBlock(text=parsed.content))
+
+        # Tool calls → ToolCallBlock + ToolCall
+        for tc in parsed.tool_calls:
+            func = tc.get("function", {})
+            name: str = func.get("name", "")
+            call_id: str = tc.get("id", "")
+            raw_args: str = func.get("arguments", "")
+
+            # Parse JSON arguments; fall back to {"_raw": ...} on failure.
+            try:
+                arguments: dict[str, Any] = json.loads(raw_args) if raw_args else {}
+            except (json.JSONDecodeError, ValueError):
+                arguments = {"_raw": raw_args}
+
+            content_blocks.append(ToolCallBlock(id=call_id, name=name, input=arguments))
+            tool_call_list.append(ToolCall(id=call_id, name=name, arguments=arguments))
+
+        finish_reason = "tool_calls" if tool_call_list else "stop"
+
+        usage = Usage(
+            input_tokens=parsed.input_tokens,
+            output_tokens=parsed.output_tokens,
+            total_tokens=parsed.input_tokens + parsed.output_tokens,
+        )
+
+        return ChatResponse(
+            content=content_blocks,
+            tool_calls=tool_call_list if tool_call_list else None,
+            usage=usage,
+            finish_reason=finish_reason,
         )

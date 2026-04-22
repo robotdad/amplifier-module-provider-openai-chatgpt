@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 # ---------------------------------------------------------------------------
 # TestModelCatalog — raw CHATGPT_MODELS dict list
@@ -606,3 +606,503 @@ class TestBuildHeaders:
         provider = self._make_provider(tokens=tokens)
         with pytest.raises(ValueError, match="account_id"):
             provider._build_headers()  # type: ignore[union-attr]
+
+
+# ---------------------------------------------------------------------------
+# TestComplete — provider.complete()
+# ---------------------------------------------------------------------------
+
+
+def _make_sse_lines(
+    text: str | None = None,
+    tool_calls: list[dict] | None = None,
+    input_tokens: int = 10,
+    output_tokens: int = 5,
+) -> list[str]:
+    """Build minimal SSE line list simulating a ChatGPT streaming response."""
+    events = []
+
+    # response.created
+    events.append(
+        json.dumps(
+            {
+                "type": "response.created",
+                "response": {"id": "resp_test", "model": "gpt-4o"},
+            }
+        )
+    )
+
+    # Text content
+    if text is not None:
+        events.append(
+            json.dumps(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": text}],
+                    },
+                }
+            )
+        )
+
+    # Tool calls
+    for tc in tool_calls or []:
+        events.append(
+            json.dumps(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "call_id": tc["id"],
+                        "name": tc["name"],
+                        "arguments": tc["arguments"],
+                    },
+                }
+            )
+        )
+
+    # response.done with usage
+    events.append(
+        json.dumps(
+            {
+                "type": "response.done",
+                "response": {
+                    "id": "resp_test",
+                    "model": "gpt-4o",
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                    },
+                },
+            }
+        )
+    )
+
+    lines = [f"data: {e}" for e in events]
+    lines.append("data: [DONE]")
+    return lines
+
+
+class _MockStreamResponse:
+    """Async mock for an httpx streaming response."""
+
+    def __init__(self, lines: list[str], status_code: int = 200) -> None:
+        self.status_code = status_code
+        self._lines = lines
+
+    async def aiter_lines(self):  # type: ignore[return]
+        for line in self._lines:
+            yield line
+
+    async def aread(self) -> bytes:
+        return b"HTTP error body"
+
+
+class _AsyncCM:
+    """Simple async context manager wrapping a value."""
+
+    def __init__(self, value: object) -> None:
+        self._value = value
+
+    async def __aenter__(self) -> object:
+        return self._value
+
+    async def __aexit__(self, *args: object) -> None:
+        pass
+
+
+def _make_sse_response(lines: list[str], status_code: int = 200) -> "_AsyncCM":
+    """Return an async-context-manager mock for httpx.AsyncClient.
+
+    Usage::
+
+        with patch("...httpx.AsyncClient") as MockClient:
+            MockClient.return_value = _make_sse_response(lines)
+            result = await provider.complete(request)
+    """
+    response = _MockStreamResponse(lines, status_code)
+    mock_client = MagicMock()
+    mock_client.stream.return_value = _AsyncCM(response)
+    return _AsyncCM(mock_client)
+
+
+class TestComplete:
+    """Tests for ChatGPTProvider.complete()."""
+
+    def _make_provider(self, raw: bool = False) -> object:
+        from datetime import datetime, timedelta, timezone
+
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        config: dict = {"raw": raw, "default_model": "gpt-4o"}
+        coordinator = MagicMock()
+        coordinator.hooks.emit = AsyncMock()
+        # Tokens that pass is_token_valid()
+        expires_at = (datetime.now(tz=timezone.utc) + timedelta(hours=1)).isoformat()
+        tokens = {
+            "access_token": "test-access-token",
+            "account_id": "acct-123",
+            "expires_at": expires_at,
+        }
+        return ChatGPTProvider(config, coordinator, tokens)
+
+    def _make_request(self, **kwargs: object) -> object:  # type: ignore[return]
+        from amplifier_core.message_models import ChatRequest, Message
+
+        messages = kwargs.pop("messages", [Message(role="user", content="hello")])
+        return ChatRequest(messages=messages, **kwargs)  # type: ignore[arg-type]
+
+    # ------------------------------------------------------------------
+    # Simple text completion
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_simple_text_completion_content(self) -> None:
+        """complete() returns ChatResponse with correct text content."""
+        provider = self._make_provider()
+        request = self._make_request()
+        sse_lines = _make_sse_lines(
+            text="Hello, world!", input_tokens=10, output_tokens=5
+        )
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(sse_lines)
+            result = await provider.complete(request)  # type: ignore[union-attr]
+
+        from amplifier_core.message_models import TextBlock
+
+        assert len(result.content) == 1
+        assert isinstance(result.content[0], TextBlock)
+        assert result.content[0].text == "Hello, world!"
+
+    @pytest.mark.asyncio
+    async def test_simple_text_completion_usage(self) -> None:
+        """complete() returns correct usage counts."""
+        provider = self._make_provider()
+        request = self._make_request()
+        sse_lines = _make_sse_lines(text="Hello!", input_tokens=10, output_tokens=5)
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(sse_lines)
+            result = await provider.complete(request)  # type: ignore[union-attr]
+
+        assert result.usage is not None
+        assert result.usage.input_tokens == 10
+        assert result.usage.output_tokens == 5
+        assert result.usage.total_tokens == 15
+
+    @pytest.mark.asyncio
+    async def test_simple_text_completion_finish_reason_stop(self) -> None:
+        """Text-only response has finish_reason='stop'."""
+        provider = self._make_provider()
+        request = self._make_request()
+        sse_lines = _make_sse_lines(text="Done.")
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(sse_lines)
+            result = await provider.complete(request)  # type: ignore[union-attr]
+
+        assert result.finish_reason == "stop"
+
+    # ------------------------------------------------------------------
+    # Tool call response
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_tool_call_response_name(self) -> None:
+        """Tool call response populates tool name correctly."""
+        provider = self._make_provider()
+        request = self._make_request()
+        sse_lines = _make_sse_lines(
+            tool_calls=[
+                {
+                    "id": "call_abc",
+                    "name": "get_weather",
+                    "arguments": '{"city": "London"}',
+                }
+            ]
+        )
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(sse_lines)
+            result = await provider.complete(request)  # type: ignore[union-attr]
+
+        from amplifier_core.message_models import ToolCallBlock
+
+        tool_blocks = [b for b in result.content if isinstance(b, ToolCallBlock)]
+        assert len(tool_blocks) == 1
+        assert tool_blocks[0].name == "get_weather"
+
+    @pytest.mark.asyncio
+    async def test_tool_call_response_id(self) -> None:
+        """Tool call response populates call ID correctly."""
+        provider = self._make_provider()
+        request = self._make_request()
+        sse_lines = _make_sse_lines(
+            tool_calls=[
+                {
+                    "id": "call_abc",
+                    "name": "get_weather",
+                    "arguments": '{"city": "London"}',
+                }
+            ]
+        )
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(sse_lines)
+            result = await provider.complete(request)  # type: ignore[union-attr]
+
+        from amplifier_core.message_models import ToolCallBlock
+
+        tool_blocks = [b for b in result.content if isinstance(b, ToolCallBlock)]
+        assert tool_blocks[0].id == "call_abc"
+
+    @pytest.mark.asyncio
+    async def test_tool_call_response_arguments_dict(self) -> None:
+        """Tool call arguments are parsed to a dict."""
+        provider = self._make_provider()
+        request = self._make_request()
+        sse_lines = _make_sse_lines(
+            tool_calls=[
+                {
+                    "id": "call_abc",
+                    "name": "get_weather",
+                    "arguments": '{"city": "London"}',
+                }
+            ]
+        )
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(sse_lines)
+            result = await provider.complete(request)  # type: ignore[union-attr]
+
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].arguments == {"city": "London"}
+
+    @pytest.mark.asyncio
+    async def test_tool_call_response_finish_reason_tool_calls(self) -> None:
+        """Response with tool calls has finish_reason='tool_calls'."""
+        provider = self._make_provider()
+        request = self._make_request()
+        sse_lines = _make_sse_lines(
+            tool_calls=[
+                {
+                    "id": "call_abc",
+                    "name": "get_weather",
+                    "arguments": '{"city": "London"}',
+                }
+            ]
+        )
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(sse_lines)
+            result = await provider.complete(request)  # type: ignore[union-attr]
+
+        assert result.finish_reason == "tool_calls"
+
+    @pytest.mark.asyncio
+    async def test_tool_call_arguments_fallback_on_bad_json(self) -> None:
+        """Invalid JSON arguments fall back to {'_raw': ...}."""
+        provider = self._make_provider()
+        request = self._make_request()
+        sse_lines = _make_sse_lines(
+            tool_calls=[
+                {"id": "call_abc", "name": "foo", "arguments": "not-valid-json"}
+            ]
+        )
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(sse_lines)
+            result = await provider.complete(request)  # type: ignore[union-attr]
+
+        assert result.tool_calls is not None
+        assert "_raw" in result.tool_calls[0].arguments
+        assert result.tool_calls[0].arguments["_raw"] == "not-valid-json"
+
+    # ------------------------------------------------------------------
+    # Event emission
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_emits_llm_request_event_provider(self) -> None:
+        """complete() emits llm:request with provider='openai-chatgpt'."""
+        provider = self._make_provider()
+        request = self._make_request()
+        sse_lines = _make_sse_lines(text="hi")
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(sse_lines)
+            await provider.complete(request)  # type: ignore[union-attr]
+
+        coordinator = provider._coordinator  # type: ignore[union-attr]
+        calls = coordinator.hooks.emit.call_args_list
+        request_calls = [c for c in calls if c.args[0] == "llm:request"]
+        assert len(request_calls) >= 1
+        event_data = request_calls[0].args[1]
+        assert event_data["provider"] == "openai-chatgpt"
+
+    @pytest.mark.asyncio
+    async def test_emits_llm_request_event_message_count(self) -> None:
+        """complete() emits llm:request with correct message_count."""
+        from amplifier_core.message_models import Message
+
+        provider = self._make_provider()
+        request = self._make_request(
+            messages=[
+                Message(role="user", content="hello"),
+                Message(role="user", content="world"),
+            ]
+        )
+        sse_lines = _make_sse_lines(text="hi")
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(sse_lines)
+            await provider.complete(request)  # type: ignore[union-attr]
+
+        coordinator = provider._coordinator  # type: ignore[union-attr]
+        calls = coordinator.hooks.emit.call_args_list
+        request_calls = [c for c in calls if c.args[0] == "llm:request"]
+        event_data = request_calls[0].args[1]
+        assert event_data["message_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_emits_llm_response_event_status_ok(self) -> None:
+        """complete() emits llm:response with status='ok' on success."""
+        provider = self._make_provider()
+        request = self._make_request()
+        sse_lines = _make_sse_lines(text="hi")
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(sse_lines)
+            await provider.complete(request)  # type: ignore[union-attr]
+
+        coordinator = provider._coordinator  # type: ignore[union-attr]
+        calls = coordinator.hooks.emit.call_args_list
+        response_calls = [c for c in calls if c.args[0] == "llm:response"]
+        assert len(response_calls) >= 1
+        event_data = response_calls[0].args[1]
+        assert event_data["status"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_emits_llm_response_event_duration_ms(self) -> None:
+        """complete() emits llm:response with duration_ms present."""
+        provider = self._make_provider()
+        request = self._make_request()
+        sse_lines = _make_sse_lines(text="hi")
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(sse_lines)
+            await provider.complete(request)  # type: ignore[union-attr]
+
+        coordinator = provider._coordinator  # type: ignore[union-attr]
+        calls = coordinator.hooks.emit.call_args_list
+        response_calls = [c for c in calls if c.args[0] == "llm:response"]
+        event_data = response_calls[0].args[1]
+        assert "duration_ms" in event_data
+        assert isinstance(event_data["duration_ms"], float)
+
+    @pytest.mark.asyncio
+    async def test_emits_llm_response_event_provider(self) -> None:
+        """complete() emits llm:response with provider='openai-chatgpt'."""
+        provider = self._make_provider()
+        request = self._make_request()
+        sse_lines = _make_sse_lines(text="hi")
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(sse_lines)
+            await provider.complete(request)  # type: ignore[union-attr]
+
+        coordinator = provider._coordinator  # type: ignore[union-attr]
+        calls = coordinator.hooks.emit.call_args_list
+        response_calls = [c for c in calls if c.args[0] == "llm:response"]
+        event_data = response_calls[0].args[1]
+        assert event_data["provider"] == "openai-chatgpt"
+
+    # ------------------------------------------------------------------
+    # Raw mode
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_raw_mode_request_event_includes_payload(self) -> None:
+        """Raw mode: llm:request event includes raw payload."""
+        provider = self._make_provider(raw=True)
+        request = self._make_request()
+        sse_lines = _make_sse_lines(text="hi")
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(sse_lines)
+            await provider.complete(request)  # type: ignore[union-attr]
+
+        coordinator = provider._coordinator  # type: ignore[union-attr]
+        calls = coordinator.hooks.emit.call_args_list
+        request_calls = [c for c in calls if c.args[0] == "llm:request"]
+        event_data = request_calls[0].args[1]
+        assert "payload" in event_data
+
+    @pytest.mark.asyncio
+    async def test_raw_mode_response_event_includes_raw_events(self) -> None:
+        """Raw mode: llm:response event includes raw_events from SSE."""
+        provider = self._make_provider(raw=True)
+        request = self._make_request()
+        sse_lines = _make_sse_lines(text="hi")
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(sse_lines)
+            await provider.complete(request)  # type: ignore[union-attr]
+
+        coordinator = provider._coordinator  # type: ignore[union-attr]
+        calls = coordinator.hooks.emit.call_args_list
+        response_calls = [c for c in calls if c.args[0] == "llm:response"]
+        event_data = response_calls[0].args[1]
+        assert "raw_events" in event_data
+
+    @pytest.mark.asyncio
+    async def test_non_raw_mode_request_no_payload(self) -> None:
+        """Non-raw mode: llm:request event does NOT include payload."""
+        provider = self._make_provider(raw=False)
+        request = self._make_request()
+        sse_lines = _make_sse_lines(text="hi")
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(sse_lines)
+            await provider.complete(request)  # type: ignore[union-attr]
+
+        coordinator = provider._coordinator  # type: ignore[union-attr]
+        calls = coordinator.hooks.emit.call_args_list
+        request_calls = [c for c in calls if c.args[0] == "llm:request"]
+        event_data = request_calls[0].args[1]
+        assert "payload" not in event_data
