@@ -8,7 +8,8 @@ import json
 import os
 import re
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.error import HTTPError
 
 
@@ -381,7 +382,7 @@ class TestRefreshTokens:
                 url="https://auth.openai.com/oauth/token",
                 code=401,
                 msg="Unauthorized",
-                hdrs={},
+                hdrs={},  # type: ignore[arg-type]
                 fp=io.BytesIO(b"Unauthorized"),
             )
         )
@@ -394,3 +395,112 @@ class TestRefreshTokens:
             )
 
         assert result is None
+
+
+def _make_http_error(body_dict: dict, code: int = 403) -> HTTPError:
+    """Create an HTTPError with a JSON body for testing.
+
+    Device code polling pending/expired responses arrive as HTTP errors
+    (403/404), NOT as 200 OK responses.  Use this helper to build those
+    errors in tests.
+    """
+    body = json.dumps(body_dict).encode("utf-8")
+    return HTTPError(
+        url="https://auth.openai.com/api/accounts/deviceauth/token",
+        code=code,
+        msg="Error",
+        hdrs={},  # type: ignore[arg-type]
+        fp=io.BytesIO(body),
+    )
+
+
+def _make_urlopen_cm(body_dict: dict) -> MagicMock:
+    """Create a context-manager mock that urlopen returns for a successful call."""
+    body = json.dumps(body_dict).encode("utf-8")
+    mock_cm = MagicMock()
+    mock_cm.read.return_value = body
+    mock_cm.__enter__.return_value = mock_cm
+    mock_cm.__exit__.return_value = False
+    return mock_cm
+
+
+class TestDeviceCodeFlow:
+    """Verify start_device_code_flow() behavior."""
+
+    def test_requests_device_code_and_returns_auth_code(self):
+        from amplifier_module_provider_openai_chatgpt.oauth import (
+            start_device_code_flow,
+        )
+
+        usercode_cm = _make_urlopen_cm(
+            {"user_code": "ABC-123", "device_auth_id": "dev_001", "interval": 5}
+        )
+        poll_success_cm = _make_urlopen_cm({"authorization_code": "auth_code_xyz"})
+        mock_urlopen = MagicMock(side_effect=[usercode_cm, poll_success_cm])
+
+        with (
+            patch(
+                "amplifier_module_provider_openai_chatgpt.oauth.urlopen", mock_urlopen
+            ),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            result = asyncio.run(start_device_code_flow())
+
+        assert "authorization_code" in result
+        assert result["authorization_code"] == "auth_code_xyz"
+        assert "code_verifier" in result
+
+    def test_handles_authorization_pending_then_success(self):
+        from amplifier_module_provider_openai_chatgpt.oauth import (
+            start_device_code_flow,
+        )
+
+        usercode_cm = _make_urlopen_cm(
+            {"user_code": "ABC-123", "device_auth_id": "dev_001", "interval": 5}
+        )
+        poll_success_cm = _make_urlopen_cm({"authorization_code": "auth_code_xyz"})
+        mock_urlopen = MagicMock(
+            side_effect=[
+                usercode_cm,
+                _make_http_error(
+                    {"error": {"code": "deviceauth_authorization_unknown"}}
+                ),
+                poll_success_cm,
+            ]
+        )
+        mock_sleep = AsyncMock()
+
+        with (
+            patch(
+                "amplifier_module_provider_openai_chatgpt.oauth.urlopen", mock_urlopen
+            ),
+            patch("asyncio.sleep", mock_sleep),
+        ):
+            result = asyncio.run(start_device_code_flow())
+
+        assert result["authorization_code"] == "auth_code_xyz"
+        assert mock_sleep.call_count == 2
+
+    def test_expired_device_code_raises(self):
+        from amplifier_module_provider_openai_chatgpt.oauth import (
+            start_device_code_flow,
+        )
+
+        usercode_cm = _make_urlopen_cm(
+            {"user_code": "ABC-123", "device_auth_id": "dev_001", "interval": 5}
+        )
+        mock_urlopen = MagicMock(
+            side_effect=[
+                usercode_cm,
+                _make_http_error({"error": {"code": "deviceauth_expired"}}),
+            ]
+        )
+
+        with (
+            patch(
+                "amplifier_module_provider_openai_chatgpt.oauth.urlopen", mock_urlopen
+            ),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            with pytest.raises(RuntimeError, match="Device code expired"):
+                asyncio.run(start_device_code_flow())
