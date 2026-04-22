@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 # ---------------------------------------------------------------------------
 # TestModelCatalog — raw CHATGPT_MODELS dict list
@@ -1185,7 +1185,9 @@ class TestCompleteErrors:
 
         coordinator = MagicMock()
         coordinator.hooks.emit = AsyncMock()
-        provider = ChatGPTProvider({"default_model": "gpt-4o"}, coordinator, tokens=None)
+        provider = ChatGPTProvider(
+            {"default_model": "gpt-4o"}, coordinator, tokens=None
+        )
         request = self._make_request()
 
         with patch(
@@ -1194,3 +1196,67 @@ class TestCompleteErrors:
         ):
             with pytest.raises(ValueError):
                 await provider.complete(request)  # type: ignore[union-attr]
+
+
+# ---------------------------------------------------------------------------
+# TestMount — module-level mount() function
+# ---------------------------------------------------------------------------
+
+
+class TestMount:
+    """Tests for the module-level mount() function in __init__.py."""
+
+    @pytest.mark.asyncio
+    async def test_mount_with_valid_token_file_succeeds(self) -> None:
+        """mount() with valid tokens calls coordinator.mount once with 'providers'
+        and name='openai-chatgpt', and returns a callable cleanup."""
+        from datetime import datetime, timedelta, timezone
+
+        from amplifier_module_provider_openai_chatgpt import mount
+
+        coordinator = MagicMock()
+        expires_at = (datetime.now(tz=timezone.utc) + timedelta(hours=1)).isoformat()
+        valid_tokens = {
+            "access_token": "test-access-token",
+            "account_id": "acct-123",
+            "expires_at": expires_at,
+        }
+
+        config = {"token_file_path": "/tmp/fake_tokens.json"}
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.load_tokens",
+            return_value=valid_tokens,
+        ):
+            with patch(
+                "amplifier_module_provider_openai_chatgpt.is_token_valid",
+                return_value=True,
+            ):
+                cleanup = await mount(coordinator, config)
+
+        coordinator.mount.assert_called_once_with(
+            "providers", ANY, name="openai-chatgpt"
+        )
+        assert callable(cleanup)
+
+    @pytest.mark.asyncio
+    async def test_mount_returns_none_no_tokens_login_disabled(self) -> None:
+        """mount() returns None when no valid tokens and login_on_mount=False.
+        coordinator.mount must not be called."""
+        from amplifier_module_provider_openai_chatgpt import mount
+
+        coordinator = MagicMock()
+        config = {"token_file_path": "/tmp/fake_tokens.json", "login_on_mount": False}
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.load_tokens",
+            return_value=None,
+        ):
+            with patch(
+                "amplifier_module_provider_openai_chatgpt.is_token_valid",
+                return_value=False,
+            ):
+                result = await mount(coordinator, config)
+
+        assert result is None
+        coordinator.mount.assert_not_called()

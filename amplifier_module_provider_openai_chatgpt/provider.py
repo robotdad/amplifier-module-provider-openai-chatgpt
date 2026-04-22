@@ -346,6 +346,12 @@ class ChatGPTProvider:
             "accept": "text/event-stream",
         }
 
+    async def close(self) -> None:
+        """Close the underlying HTTP client if it was created."""
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
     async def _ensure_valid_tokens(self) -> None:
         """Guarantee ``self._tokens`` holds a valid, unexpired access token.
 
