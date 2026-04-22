@@ -301,8 +301,8 @@ class ChatGPTProvider:
             "store": False,
         }
 
-        if instructions is not None:
-            payload["instructions"] = instructions
+        # ChatGPT backend requires instructions even when no system message is present.
+        payload["instructions"] = instructions or ""
 
         if service_tier is not None:
             payload["service_tier"] = service_tier
