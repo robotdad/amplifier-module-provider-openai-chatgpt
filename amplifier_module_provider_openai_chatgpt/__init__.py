@@ -70,7 +70,7 @@ async def mount(
 
     # Create and register the provider.
     provider = ChatGPTProvider(config, coordinator, tokens)
-    coordinator.mount("providers", provider, name="openai-chatgpt")
+    await coordinator.mount("providers", provider, name="openai-chatgpt")
 
     # Return an async cleanup callable.
     async def cleanup() -> None:
