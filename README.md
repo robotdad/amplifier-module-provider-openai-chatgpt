@@ -84,24 +84,55 @@ uv run ruff format --check .
 
 ### Testing with a Local Amplifier Install
 
-To wire this module into an Amplifier session for live testing, use a source override in your project's `.amplifier/settings.yaml`:
-
-```yaml
-sources:
-  provider-openai-chatgpt: file:///path/to/amplifier-module-provider-openai-chatgpt
-```
-
-Or set the environment variable:
+**Option A: CLI source override (quickest for dev testing)**
 
 ```bash
-export AMPLIFIER_MODULE_PROVIDER_OPENAI_CHATGPT=/path/to/amplifier-module-provider-openai-chatgpt
+# Register the local checkout
+amplifier source add provider-openai-chatgpt \
+  /path/to/amplifier-module-provider-openai-chatgpt \
+  --local
+
+# Verify
+amplifier source list
+
+# Test
+amplifier run "Hello, can you hear me?"
+
+# Cleanup when done
+amplifier source remove provider-openai-chatgpt --local
 ```
 
-Then configure the provider in your bundle:
+The `--local` flag writes to `.amplifier/settings.local.yaml` (gitignored). No `file:///` prefix needed -- just a bare path.
 
-```toml
-[providers.provider-openai-chatgpt]
-default_model = "o4-mini"
+Your active bundle must include the provider in its `providers:` section for Amplifier to load it.
+
+**Option B: Inline source in a test bundle (self-contained)**
+
+Create a test bundle file (e.g. `test-chatgpt.md`):
+
+```markdown
+---
+bundle:
+  name: test-openai-chatgpt
+  version: 0.1.0
+
+includes:
+  - bundle: git+https://github.com/microsoft/amplifier-foundation@main
+
+providers:
+  - module: provider-openai-chatgpt
+    source: /path/to/amplifier-module-provider-openai-chatgpt
+    config:
+      default_model: o4-mini
+---
+
+# Test: provider-openai-chatgpt
+```
+
+Then run directly against it:
+
+```bash
+amplifier run --bundle ./test-chatgpt.md "Hello, can you hear me?"
 ```
 
 ## Dependencies
