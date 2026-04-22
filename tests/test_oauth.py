@@ -1,11 +1,56 @@
 """Tests for oauth.py constants and structure."""
 
+import asyncio
 import base64
 import hashlib
+import io
 import json
 import os
 import re
 from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
+from urllib.error import HTTPError
+
+
+# ---------------------------------------------------------------------------
+# Shared test helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_jwt(payload_dict: dict) -> str:
+    """Create an unsigned JWT string (header.payload.signature) for testing.
+
+    The signature part is left empty — this mirrors how unsigned tokens are
+    structured and is sufficient for decode-only tests.
+    """
+    header = (
+        base64.urlsafe_b64encode(json.dumps({"alg": "none", "typ": "JWT"}).encode())
+        .rstrip(b"=")
+        .decode()
+    )
+    payload = (
+        base64.urlsafe_b64encode(json.dumps(payload_dict).encode())
+        .rstrip(b"=")
+        .decode()
+    )
+    return f"{header}.{payload}."
+
+
+def _mock_urlopen_response(body_dict: dict) -> MagicMock:
+    """Return a mock urlopen callable that yields the given JSON response body.
+
+    Usage::
+
+        mock_urlopen = _mock_urlopen_response({"access_token": "tok"})
+        with patch("...urlopen", mock_urlopen):
+            ...
+    """
+    body = json.dumps(body_dict).encode("utf-8")
+    mock_response = MagicMock()
+    mock_response.read.return_value = body
+    mock_response.__enter__.return_value = mock_response
+    mock_response.__exit__.return_value = False
+    return MagicMock(return_value=mock_response)
 
 
 class TestConstants:
@@ -271,3 +316,81 @@ class TestIsTokenValid:
 
         tokens = {"access_token": "abc"}
         assert is_token_valid(tokens) is False
+
+
+class TestExtractAccountId:
+    """Verify extract_account_id() JWT decoding behavior."""
+
+    def test_extracts_account_id_from_profile_claim(self):
+        from amplifier_module_provider_openai_chatgpt.oauth import extract_account_id
+
+        jwt = _make_jwt({"https://api.openai.com/profile": {"account_id": "acc_123"}})
+        assert extract_account_id(jwt) == "acc_123"
+
+    def test_falls_back_to_sub_claim(self):
+        from amplifier_module_provider_openai_chatgpt.oauth import extract_account_id
+
+        jwt = _make_jwt({"sub": "sub_456"})
+        assert extract_account_id(jwt) == "sub_456"
+
+    def test_returns_empty_string_for_invalid_jwt(self):
+        from amplifier_module_provider_openai_chatgpt.oauth import extract_account_id
+
+        assert extract_account_id("not_a_valid_jwt") == ""
+
+    def test_returns_empty_string_for_empty_string(self):
+        from amplifier_module_provider_openai_chatgpt.oauth import extract_account_id
+
+        assert extract_account_id("") == ""
+
+
+class TestRefreshTokens:
+    """Verify refresh_tokens() HTTP behavior."""
+
+    def test_successful_refresh_returns_new_tokens_with_account_id(self, tmp_path):
+        from amplifier_module_provider_openai_chatgpt.oauth import refresh_tokens
+
+        # Write existing tokens so that refresh_tokens can preserve account_id.
+        token_path = str(tmp_path / "tokens.json")
+        with open(token_path, "w") as f:
+            json.dump({"account_id": "existing_acc", "access_token": "old"}, f)
+
+        mock_urlopen = _mock_urlopen_response(
+            {
+                "access_token": "new_access",
+                "refresh_token": "new_refresh",
+                "expires_in": 3600,
+            }
+        )
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.oauth.urlopen", mock_urlopen
+        ):
+            result = asyncio.run(refresh_tokens("test_refresh", path=token_path))
+
+        assert result is not None
+        assert result["auth_mode"] == "oauth"
+        assert result["access_token"] == "new_access"
+        assert result["account_id"] == "existing_acc"
+
+    def test_refresh_failure_http_401_returns_none(self, tmp_path):
+        from amplifier_module_provider_openai_chatgpt.oauth import refresh_tokens
+
+        mock_urlopen = MagicMock(
+            side_effect=HTTPError(
+                url="https://auth.openai.com/oauth/token",
+                code=401,
+                msg="Unauthorized",
+                hdrs={},
+                fp=io.BytesIO(b"Unauthorized"),
+            )
+        )
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.oauth.urlopen", mock_urlopen
+        ):
+            result = asyncio.run(
+                refresh_tokens("bad_refresh", path=str(tmp_path / "tokens.json"))
+            )
+
+        assert result is None
