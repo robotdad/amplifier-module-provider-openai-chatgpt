@@ -24,36 +24,85 @@ Connects Amplifier to the ChatGPT backend API using OAuth device code authentica
 
 ```toml
 [providers.provider-openai-chatgpt]
-model = "o4-mini"
+default_model = "o4-mini"
 ```
+
+### All Config Options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `default_model` | str | `"gpt-4o"` | Model to use for inference |
+| `raw` | bool | `false` | Include full request/response payloads in `llm:request`/`llm:response` hook events (for debugging) |
+| `login_on_mount` | bool | `true` | Trigger interactive device code login if tokens are absent or expired. Set `false` for non-interactive environments. |
+| `token_file_path` | str | `~/.amplifier/openai-chatgpt-oauth.json` | Path to the OAuth token JSON file |
+| `timeout` | float | `300.0` | HTTP timeout in seconds for streaming requests |
 
 ### Authentication
 
 On first use, the provider initiates an OAuth device code flow:
 
-1. Displays a URL and code in the terminal
+1. Displays a verification URL (`https://auth.openai.com/codex/device`) and a code in the terminal
 2. You open the URL in a browser and enter the code
-3. Tokens are cached locally for subsequent use
+3. Tokens are cached to `~/.amplifier/openai-chatgpt-oauth.json` for subsequent use
 
-Requires "Sign in with device code" to be enabled in your ChatGPT account security settings.
+Tokens auto-refresh silently when they expire. If the refresh token itself expires, the device code flow runs again.
 
-## Environment Variables
+Requires "Sign in with device code" to be enabled in your ChatGPT account security settings (Settings > Security).
 
-No API key required. Authentication is handled via OAuth device code flow.
-
-Token cache location can be configured via:
-
-```bash
-export CHATGPT_TOKEN_PATH="~/.config/amplifier/chatgpt_tokens.json"
-```
+Works in SSH/headless sessions -- the device code flow only requires a browser on any device, not the machine running Amplifier.
 
 ## Features
 
-- OAuth device code authentication (no API key needed)
+- OAuth device code authentication with PKCE (no API key needed)
 - Raw httpx + manual SSE streaming (not the OpenAI SDK)
-- Automatic token refresh
+- Automatic token refresh with 4-step fallback chain
 - Tool calling support
 - Reasoning model support (o4-mini, o3, etc.)
+- `-fast` model suffix support (e.g. `o4-mini-fast` -> `o4-mini` with `service_tier: "priority"`)
+- `llm:request`/`llm:response` hook events with optional raw payload inclusion
+
+## Local Development
+
+```bash
+# Clone
+git clone https://github.com/robotdad/amplifier-module-provider-openai-chatgpt.git
+cd amplifier-module-provider-openai-chatgpt
+
+# Install deps (including dev group: amplifier-core, pytest, ruff)
+uv sync
+
+# Run tests
+uv run pytest tests/ -v
+
+# Run a specific test file
+uv run pytest tests/test_sse.py -v
+
+# Lint and format check
+uv run ruff check .
+uv run ruff format --check .
+```
+
+### Testing with a Local Amplifier Install
+
+To wire this module into an Amplifier session for live testing, use a source override in your project's `.amplifier/settings.yaml`:
+
+```yaml
+sources:
+  provider-openai-chatgpt: file:///path/to/amplifier-module-provider-openai-chatgpt
+```
+
+Or set the environment variable:
+
+```bash
+export AMPLIFIER_MODULE_PROVIDER_OPENAI_CHATGPT=/path/to/amplifier-module-provider-openai-chatgpt
+```
+
+Then configure the provider in your bundle:
+
+```toml
+[providers.provider-openai-chatgpt]
+default_model = "o4-mini"
+```
 
 ## Dependencies
 
