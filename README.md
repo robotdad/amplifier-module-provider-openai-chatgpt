@@ -126,6 +126,49 @@ providers:
 amplifier run --bundle ./test-chatgpt.md "Hello, can you hear me?"
 ```
 
+## Routing Matrix
+
+If you use Amplifier's routing matrix, the default matrices reference `provider: openai` which does **not** match this module's name (`provider-openai-chatgpt`). A test routing matrix is included in this repo at `routing/openai-chatgpt-test.yaml`.
+
+To use it:
+
+```bash
+# Copy to your user routing directory
+cp routing/openai-chatgpt-test.yaml ~/.amplifier/routing/
+
+# Activate it
+amplifier routing use openai-chatgpt-test
+
+# Verify
+amplifier routing show
+
+# Switch back when done
+amplifier routing use balanced
+```
+
+See [amplifier-support#212](https://github.com/microsoft-amplifier/amplifier-support/issues/212) for the upstream issue about provider name matching.
+
+## Supported Models
+
+| Model | Context Window | Max Output |
+|-------|---------------|------------|
+| gpt-5.4, gpt-5.4-pro, gpt-5.4-fast, gpt-5.4-mini | 272K-400K | 128K |
+| gpt-5.3-codex, gpt-5.3-codex-spark | 128K-272K | 128K |
+| gpt-5.2, gpt-5.2-codex | 272K | 128K |
+| gpt-5.1, gpt-5.1-codex, gpt-5.1-codex-mini, gpt-5.1-codex-max | 272K | 128K |
+| gpt-5-codex-mini | 272K | 128K |
+| gpt-4o, gpt-4o-mini | 128K | 16K |
+| o1, o1-pro, o3, o3-mini, o4-mini | 200K | 100K |
+
+Append `-fast` to any model name (e.g. `gpt-5.4-fast`) to strip the suffix and set `service_tier: "priority"`.
+
+## Known Limitations
+
+- **No retry logic** -- transient 5xx or network errors fail immediately. Retry/backoff is planned.
+- **No `response.incomplete` continuation** -- if a reasoning model hits its output limit, the partial response is lost. Auto-continuation is planned.
+- **Streaming is mandatory** -- the ChatGPT backend requires `stream=True`. The provider always streams internally but returns a complete `ChatResponse` to the orchestrator.
+- **Static model catalog** -- new models require a code update. No dynamic model discovery.
+
 ## Dependencies
 
 - `httpx` - HTTP client for raw API requests

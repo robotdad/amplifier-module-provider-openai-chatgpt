@@ -1,0 +1,78 @@
+name: openai-chatgpt-test
+description: "Route all roles to provider-openai-chatgpt for testing."
+updated: "2026-04-22"
+
+roles:
+  general:
+    description: "Versatile catch-all"
+    candidates:
+      - provider: openai-chatgpt
+        model: gpt-5.4
+
+  fast:
+    description: "Quick utility tasks"
+    candidates:
+      - provider: openai-chatgpt
+        model: gpt-4o-mini
+
+  coding:
+    description: "Code generation"
+    candidates:
+      - provider: openai-chatgpt
+        model: gpt-5.4
+
+  ui-coding:
+    description: "Frontend/UI code"
+    candidates:
+      - provider: openai-chatgpt
+        model: gpt-5.4
+
+  security-audit:
+    description: "Vulnerability assessment"
+    candidates:
+      - provider: openai-chatgpt
+        model: gpt-5.4
+
+  reasoning:
+    description: "Deep architectural reasoning"
+    candidates:
+      - provider: openai-chatgpt
+        model: gpt-5.4
+        config:
+          reasoning_effort: high
+
+  critique:
+    description: "Analytical evaluation"
+    candidates:
+      - provider: openai-chatgpt
+        model: gpt-5.4
+
+  creative:
+    description: "Creative output"
+    candidates:
+      - provider: openai-chatgpt
+        model: gpt-5.4
+
+  writing:
+    description: "Long-form content"
+    candidates:
+      - provider: openai-chatgpt
+        model: gpt-5.4
+
+  research:
+    description: "Deep investigation"
+    candidates:
+      - provider: openai-chatgpt
+        model: gpt-5.4
+
+  vision:
+    description: "Visual input understanding"
+    candidates:
+      - provider: openai-chatgpt
+        model: gpt-4o
+
+  critical-ops:
+    description: "High-reliability operational tasks"
+    candidates:
+      - provider: openai-chatgpt
+        model: gpt-5.4
