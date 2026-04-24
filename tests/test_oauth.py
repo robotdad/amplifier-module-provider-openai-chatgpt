@@ -377,6 +377,36 @@ class TestExtractAccountId:
         assert extract_account_id("") == ""
 
 
+class TestExtractPlanType:
+    """Verify extract_plan_type() JWT decoding behavior."""
+
+    def test_extract_plan_type_happy_path(self) -> None:
+        """JWT with chatgpt_plan_type='pro' returns 'pro'."""
+        from amplifier_module_provider_openai_chatgpt.oauth import extract_plan_type
+
+        jwt = _make_jwt({"https://api.openai.com/auth": {"chatgpt_plan_type": "pro"}})
+        assert extract_plan_type(jwt) == "pro"
+
+    def test_extract_plan_type_missing_claim(self) -> None:
+        """JWT with no auth claim returns empty string."""
+        from amplifier_module_provider_openai_chatgpt.oauth import extract_plan_type
+
+        jwt = _make_jwt({"sub": "user_abc", "email": "user@example.com"})
+        assert extract_plan_type(jwt) == ""
+
+    def test_extract_plan_type_malformed_jwt(self) -> None:
+        """Malformed JWT (not three dot-separated parts) returns empty string."""
+        from amplifier_module_provider_openai_chatgpt.oauth import extract_plan_type
+
+        assert extract_plan_type("not_a_valid_jwt") == ""
+
+    def test_extract_plan_type_empty_string(self) -> None:
+        """Empty string input returns empty string."""
+        from amplifier_module_provider_openai_chatgpt.oauth import extract_plan_type
+
+        assert extract_plan_type("") == ""
+
+
 class TestRefreshTokens:
     """Verify refresh_tokens() HTTP behavior."""
 

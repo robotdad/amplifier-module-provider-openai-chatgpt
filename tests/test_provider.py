@@ -7,68 +7,41 @@ import pytest
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 # ---------------------------------------------------------------------------
-# TestModelCatalog — raw CHATGPT_MODELS dict list
+# TestFallbackCatalog — FALLBACK_MODELS in models.py
 # ---------------------------------------------------------------------------
 
 
-class TestModelCatalog:
-    def test_catalog_is_nonempty(self) -> None:
-        from amplifier_module_provider_openai_chatgpt.provider import CHATGPT_MODELS
+class TestFallbackCatalog:
+    """Verify the fallback model entries have the expected shape."""
 
-        assert len(CHATGPT_MODELS) > 0
+    def test_fallback_models_nonempty(self) -> None:
+        from amplifier_module_provider_openai_chatgpt.models import FALLBACK_MODELS
 
-    def test_catalog_entries_have_required_fields(self) -> None:
-        from amplifier_module_provider_openai_chatgpt.provider import CHATGPT_MODELS
+        assert len(FALLBACK_MODELS) > 0
 
-        for entry in CHATGPT_MODELS:
-            assert "name" in entry, f"Missing 'name' in {entry}"
-            assert "context_window" in entry, f"Missing 'context_window' in {entry}"
-            assert "max_output_tokens" in entry, (
-                f"Missing 'max_output_tokens' in {entry}"
-            )
+    def test_fallback_entries_have_slug(self) -> None:
+        from amplifier_module_provider_openai_chatgpt.models import FALLBACK_MODELS
 
-    def test_catalog_contains_known_model_gpt54(self) -> None:
-        from amplifier_module_provider_openai_chatgpt.provider import CHATGPT_MODELS
+        for entry in FALLBACK_MODELS:
+            assert "slug" in entry, f"Missing 'slug' in {entry}"
 
-        names = [m["name"] for m in CHATGPT_MODELS]
-        assert "gpt-5.4" in names
+    def test_fallback_contains_gpt_4o(self) -> None:
+        from amplifier_module_provider_openai_chatgpt.models import FALLBACK_MODELS
 
-    def test_catalog_contains_known_model_o4_mini(self) -> None:
-        from amplifier_module_provider_openai_chatgpt.provider import CHATGPT_MODELS
+        slugs = [m["slug"] for m in FALLBACK_MODELS]
+        assert "gpt-4o" in slugs
 
-        names = [m["name"] for m in CHATGPT_MODELS]
-        assert "o4-mini" in names
+    def test_fallback_contains_gpt_52(self) -> None:
+        from amplifier_module_provider_openai_chatgpt.models import FALLBACK_MODELS
 
-    def test_catalog_contains_known_model_gpt4o(self) -> None:
-        from amplifier_module_provider_openai_chatgpt.provider import CHATGPT_MODELS
+        slugs = [m["slug"] for m in FALLBACK_MODELS]
+        assert "gpt-5.2" in slugs
 
-        names = [m["name"] for m in CHATGPT_MODELS]
-        assert "gpt-4o" in names
+    def test_fallback_gpt_52_has_fast_tier(self) -> None:
+        from amplifier_module_provider_openai_chatgpt.models import FALLBACK_MODELS
 
-    def test_gpt54_context_window(self) -> None:
-        from amplifier_module_provider_openai_chatgpt.provider import CHATGPT_MODELS
-
-        entry = next(m for m in CHATGPT_MODELS if m["name"] == "gpt-5.4")
-        assert entry["context_window"] == 272000
-
-    def test_gpt54_max_output_tokens(self) -> None:
-        from amplifier_module_provider_openai_chatgpt.provider import CHATGPT_MODELS
-
-        entry = next(m for m in CHATGPT_MODELS if m["name"] == "gpt-5.4")
-        assert entry["max_output_tokens"] == 128000
-
-    def test_gpt4o_context_window_and_max_output(self) -> None:
-        from amplifier_module_provider_openai_chatgpt.provider import CHATGPT_MODELS
-
-        entry = next(m for m in CHATGPT_MODELS if m["name"] == "gpt-4o")
-        assert entry["context_window"] == 128000
-        assert entry["max_output_tokens"] == 16384
-
-    def test_o4_mini_context_window(self) -> None:
-        from amplifier_module_provider_openai_chatgpt.provider import CHATGPT_MODELS
-
-        entry = next(m for m in CHATGPT_MODELS if m["name"] == "o4-mini")
-        assert entry["context_window"] == 200000
+        entry = next(m for m in FALLBACK_MODELS if m["slug"] == "gpt-5.2")
+        assert "fast" in entry.get("additional_speed_tiers", [])
 
 
 # ---------------------------------------------------------------------------
@@ -107,52 +80,78 @@ class TestGetInfo:
 
 
 # ---------------------------------------------------------------------------
-# TestListModels — provider.list_models()
+# TestListModels — provider.list_models() shape validation
 # ---------------------------------------------------------------------------
 
 
 class TestListModels:
+    """Verify that list_models() returns well-formed ModelInfo objects.
+
+    Uses FALLBACK_MODELS as the mock return value of fetch_models so the
+    tests are deterministic and require no network access.
+    """
+
     def _make_provider(self) -> object:
+        from datetime import datetime, timedelta, timezone
+
         from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
 
         config: dict = {}
         coordinator = MagicMock()
-        tokens: dict | None = None
+        expires_at = (datetime.now(tz=timezone.utc) + timedelta(hours=1)).isoformat()
+        tokens = {
+            "access_token": "test-token",
+            "account_id": "acct-123",
+            "expires_at": expires_at,
+        }
         return ChatGPTProvider(config, coordinator, tokens)
 
-    @pytest.mark.asyncio
-    async def test_list_models_correct_count(self) -> None:
-        from amplifier_module_provider_openai_chatgpt.provider import CHATGPT_MODELS
+    def _sample_entries(self) -> list[dict]:
+        from amplifier_module_provider_openai_chatgpt.models import FALLBACK_MODELS
 
-        provider = self._make_provider()
-        models = await provider.list_models()  # type: ignore[union-attr]
-        assert len(models) == len(CHATGPT_MODELS)
+        return list(FALLBACK_MODELS)
 
     @pytest.mark.asyncio
     async def test_list_models_all_have_id(self) -> None:
         provider = self._make_provider()
-        models = await provider.list_models()  # type: ignore[union-attr]
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
+            new=AsyncMock(return_value=self._sample_entries()),
+        ):
+            models = await provider.list_models()  # type: ignore[union-attr]
         for m in models:
             assert m.id, f"Model missing id: {m}"
 
     @pytest.mark.asyncio
     async def test_list_models_all_have_display_name(self) -> None:
         provider = self._make_provider()
-        models = await provider.list_models()  # type: ignore[union-attr]
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
+            new=AsyncMock(return_value=self._sample_entries()),
+        ):
+            models = await provider.list_models()  # type: ignore[union-attr]
         for m in models:
             assert m.display_name, f"Model missing display_name: {m}"
 
     @pytest.mark.asyncio
     async def test_list_models_all_have_context_window(self) -> None:
         provider = self._make_provider()
-        models = await provider.list_models()  # type: ignore[union-attr]
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
+            new=AsyncMock(return_value=self._sample_entries()),
+        ):
+            models = await provider.list_models()  # type: ignore[union-attr]
         for m in models:
             assert m.context_window > 0, f"Model missing context_window: {m}"
 
     @pytest.mark.asyncio
     async def test_list_models_all_have_max_output_tokens(self) -> None:
         provider = self._make_provider()
-        models = await provider.list_models()  # type: ignore[union-attr]
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
+            new=AsyncMock(return_value=self._sample_entries()),
+        ):
+            models = await provider.list_models()  # type: ignore[union-attr]
         for m in models:
             assert m.max_output_tokens > 0, f"Model missing max_output_tokens: {m}"
 
@@ -161,7 +160,11 @@ class TestListModels:
         from amplifier_core import ModelInfo
 
         provider = self._make_provider()
-        models = await provider.list_models()  # type: ignore[union-attr]
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
+            new=AsyncMock(return_value=self._sample_entries()),
+        ):
+            models = await provider.list_models()  # type: ignore[union-attr]
         for m in models:
             assert isinstance(m, ModelInfo), f"Expected ModelInfo, got {type(m)}"
 
@@ -1268,3 +1271,136 @@ class TestMount:
 
         assert result is None
         coordinator.mount.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestListModelsDynamic — caching logic in _get_catalog() / list_models()
+# ---------------------------------------------------------------------------
+
+
+class TestListModelsDynamic:
+    """Tests for the cached model fetching introduced by _get_catalog().
+
+    Follows the same token-mocking approach as TestComplete: valid tokens
+    are set on the provider so _ensure_valid_tokens() passes immediately,
+    and fetch_models is patched to control catalog fetch behaviour.
+    """
+
+    def _make_provider(self, models_cache_ttl: float = 3600.0) -> object:
+        from datetime import datetime, timedelta, timezone
+
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        expires_at = (datetime.now(tz=timezone.utc) + timedelta(hours=1)).isoformat()
+        tokens = {
+            "access_token": "test-access-token",
+            "account_id": "acct-123",
+            "expires_at": expires_at,
+        }
+        config = {"models_cache_ttl": models_cache_ttl, "default_model": "gpt-4o"}
+        coordinator = MagicMock()
+        return ChatGPTProvider(config, coordinator, tokens)
+
+    def _sample_entries(self) -> list[dict]:
+        """Single API-visible model entry (no fast tier) for deterministic tests."""
+        return [
+            {
+                "slug": "gpt-4o",
+                "display_name": "GPT-4o",
+                "context_window": 128000,
+                "supported_in_api": True,
+                "visibility": "visible",
+                "additional_speed_tiers": [],
+                "supported_reasoning_levels": [],
+                "default_reasoning_level": None,
+            }
+        ]
+
+    # ------------------------------------------------------------------
+    # First-call fetch
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_list_models_fetches_on_first_call(self) -> None:
+        """First call to list_models() fetches from API exactly once."""
+        provider = self._make_provider()
+        mock_fetch = AsyncMock(return_value=self._sample_entries())
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
+            mock_fetch,
+        ):
+            result = await provider.list_models()  # type: ignore[union-attr]
+
+        mock_fetch.assert_awaited_once()
+        assert len(result) == 1
+        assert result[0].id == "gpt-4o"
+
+    # ------------------------------------------------------------------
+    # Cache hit on second call
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_list_models_uses_cache_on_second_call(self) -> None:
+        """Second call within TTL returns cached result; fetch_models called once."""
+        provider = self._make_provider()
+        mock_fetch = AsyncMock(return_value=self._sample_entries())
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
+            mock_fetch,
+        ):
+            await provider.list_models()  # type: ignore[union-attr]
+            await provider.list_models()  # type: ignore[union-attr]
+
+        mock_fetch.assert_awaited_once()
+
+    # ------------------------------------------------------------------
+    # Fallback on failure, cache stays empty
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_list_models_falls_back_on_failure(self) -> None:
+        """When fetch_models raises, fallback models are returned and cache stays None."""
+        from amplifier_module_provider_openai_chatgpt.models import FALLBACK_MODELS
+
+        provider = self._make_provider()
+        mock_fetch = AsyncMock(side_effect=ValueError("simulated API error"))
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
+            mock_fetch,
+        ):
+            result = await provider.list_models()  # type: ignore[union-attr]
+
+        # All fallback slugs must appear in the result (some produce -fast variants).
+        fallback_slugs = {entry["slug"] for entry in FALLBACK_MODELS}
+        result_ids = {m.id for m in result}
+        for slug in fallback_slugs:
+            assert slug in result_ids or f"{slug}-fast" in result_ids, (
+                f"Expected fallback slug {slug!r} (or its -fast variant) in {result_ids}"
+            )
+
+        # Cache must NOT be populated on failure — next call should retry.
+        assert provider._models_cache is None  # type: ignore[union-attr]
+
+    # ------------------------------------------------------------------
+    # TTL expiry causes re-fetch
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_list_models_ttl_expiry_refetches(self) -> None:
+        """With models_cache_ttl=0, each call triggers a fresh fetch."""
+        provider = self._make_provider(models_cache_ttl=0.0)
+        mock_fetch = AsyncMock(return_value=self._sample_entries())
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
+            mock_fetch,
+        ):
+            await provider.list_models()  # type: ignore[union-attr]
+            await provider.list_models()  # type: ignore[union-attr]
+
+        assert mock_fetch.await_count == 2, (
+            f"Expected 2 fetches with TTL=0, got {mock_fetch.await_count}"
+        )

@@ -208,10 +208,16 @@ async def refresh_tokens(refresh_token: str, path: str | None = None) -> dict | 
     if "id_token" in token_data:
         account_id = extract_account_id(token_data["id_token"]) or None
 
-    # Fall back: preserve account_id from any existing tokens stored on disk.
-    if not account_id:
+    # Extract plan_type from the new id_token if present.
+    plan_type = extract_plan_type(token_data.get("id_token", ""))
+
+    # Fall back: preserve account_id and plan_type from any existing tokens stored on disk.
+    if not account_id or not plan_type:
         existing = load_tokens(path)
-        account_id = existing.get("account_id") if existing else None
+        if not account_id:
+            account_id = existing.get("account_id") if existing else None
+        if not plan_type:
+            plan_type = (existing or {}).get("plan_type", "")
 
     result = {
         "auth_mode": "oauth",
@@ -219,6 +225,7 @@ async def refresh_tokens(refresh_token: str, path: str | None = None) -> dict | 
         "refresh_token": token_data.get("refresh_token", refresh_token),
         "id_token": token_data.get("id_token"),
         "account_id": account_id,
+        "plan_type": plan_type,
         "expires_at": expires_at,
     }
 
@@ -285,6 +292,7 @@ async def exchange_code_for_tokens(
 
     id_token = token_data.get("id_token", "")
     account_id = extract_account_id(id_token)
+    plan_type = extract_plan_type(id_token)
 
     expires_in = token_data.get("expires_in", 3600)
     expires_at = (
@@ -297,6 +305,7 @@ async def exchange_code_for_tokens(
         "refresh_token": token_data.get("refresh_token"),
         "id_token": id_token,
         "account_id": account_id,
+        "plan_type": plan_type,
         "expires_at": expires_at,
     }
 
@@ -351,6 +360,50 @@ def extract_account_id(id_token: str) -> str:
 
         # Fallback: standard subject claim.
         return str(payload.get("sub", ""))
+    except Exception:
+        return ""
+
+
+def extract_plan_type(id_token: str) -> str:
+    """Decode a JWT id_token and extract the ChatGPT plan type.
+
+    Decodes the JWT payload segment without signature verification (the token
+    was just received over HTTPS from the issuer).  Looks for
+    ``chatgpt_plan_type`` inside the ``https://api.openai.com/auth`` custom
+    claim.
+
+    Adds base64url padding if needed before decoding.
+
+    Args:
+        id_token: A JWT string in the form ``header.payload.signature``.
+
+    Returns:
+        The plan type string (e.g. ``"pro"``), or an empty string on any
+        failure (empty input, malformed JWT, missing claim, decode errors).
+    """
+    if not id_token:
+        return ""
+
+    try:
+        parts = id_token.split(".")
+        if len(parts) != 3:
+            return ""
+
+        payload_b64 = parts[1]
+        # Add base64url padding so that len is a multiple of 4.
+        padding_needed = (4 - len(payload_b64) % 4) % 4
+        payload_b64 += "=" * padding_needed
+
+        payload_bytes = base64.urlsafe_b64decode(payload_b64)
+        payload = json.loads(payload_bytes)
+
+        auth_claim = payload.get("https://api.openai.com/auth")
+        if isinstance(auth_claim, dict):
+            plan_type = auth_claim.get("chatgpt_plan_type", "")
+            if plan_type:
+                return str(plan_type)
+
+        return ""
     except Exception:
         return ""
 
@@ -569,6 +622,7 @@ async def login(*, token_file_path: str | None = None) -> dict:
                         "refresh_token": result.get("refresh_token", ""),
                         "id_token": result.get("id_token", ""),
                         "account_id": extract_account_id(result.get("id_token", "")),
+                        "plan_type": extract_plan_type(result.get("id_token", "")),
                         "expires_at": result.get("expires_at") or expires_at,
                     }
                     save_tokens(tokens, token_file_path)

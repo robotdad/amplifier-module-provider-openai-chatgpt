@@ -6,6 +6,7 @@ against the ChatGPT backend API with OAuth authentication.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -27,6 +28,12 @@ from amplifier_core.message_models import (
 from amplifier_core.utils import redact_secrets
 
 from ._sse import ParsedResponse, parse_sse_events
+from .models import (
+    DEFAULT_CACHE_TTL_SECONDS,
+    FALLBACK_MODELS,
+    fetch_models,
+    to_model_infos,
+)
 from .oauth import (
     CHATGPT_CODEX_BASE_URL,
     is_token_valid,
@@ -38,52 +45,6 @@ logger = logging.getLogger(__name__)
 
 # Full endpoint for the ChatGPT Responses API
 CHATGPT_CODEX_ENDPOINT = CHATGPT_CODEX_BASE_URL + "/responses"
-
-# ---------------------------------------------------------------------------
-# Model catalog
-# ---------------------------------------------------------------------------
-
-CHATGPT_MODELS: list[dict[str, Any]] = [
-    # GPT-5.4 (supports none/low/medium/high/xhigh reasoning)
-    {"name": "gpt-5.4", "context_window": 272000, "max_output_tokens": 128000},
-    {"name": "gpt-5.4-pro", "context_window": 272000, "max_output_tokens": 128000},
-    {"name": "gpt-5.4-fast", "context_window": 272000, "max_output_tokens": 128000},
-    {"name": "gpt-5.4-mini", "context_window": 400000, "max_output_tokens": 128000},
-    # GPT-5.3 codex
-    {"name": "gpt-5.3-codex", "context_window": 272000, "max_output_tokens": 128000},
-    {
-        "name": "gpt-5.3-codex-spark",
-        "context_window": 128000,
-        "max_output_tokens": 128000,
-    },
-    # GPT-5.2 models (supports none/low/medium/high/xhigh reasoning)
-    {"name": "gpt-5.2", "context_window": 272000, "max_output_tokens": 128000},
-    {"name": "gpt-5.2-codex", "context_window": 272000, "max_output_tokens": 128000},
-    # GPT-5.1 models
-    {"name": "gpt-5.1", "context_window": 272000, "max_output_tokens": 128000},
-    {"name": "gpt-5.1-codex", "context_window": 272000, "max_output_tokens": 128000},
-    {
-        "name": "gpt-5.1-codex-mini",
-        "context_window": 272000,
-        "max_output_tokens": 128000,
-    },
-    {
-        "name": "gpt-5.1-codex-max",
-        "context_window": 272000,
-        "max_output_tokens": 128000,
-    },
-    # GPT-5 Codex models (original)
-    {"name": "gpt-5-codex-mini", "context_window": 272000, "max_output_tokens": 128000},
-    # GPT-4 models (for ChatGPT Plus users)
-    {"name": "gpt-4o", "context_window": 128000, "max_output_tokens": 16384},
-    {"name": "gpt-4o-mini", "context_window": 128000, "max_output_tokens": 16384},
-    # o1 series
-    {"name": "o1", "context_window": 200000, "max_output_tokens": 100000},
-    {"name": "o1-pro", "context_window": 200000, "max_output_tokens": 100000},
-    {"name": "o3", "context_window": 200000, "max_output_tokens": 100000},
-    {"name": "o3-mini", "context_window": 200000, "max_output_tokens": 100000},
-    {"name": "o4-mini", "context_window": 200000, "max_output_tokens": 100000},
-]
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +73,13 @@ class ChatGPTProvider:
         self.timeout: float = float(self._config.get("timeout", 300.0))
         self._token_file_path: str | None = self._config.get("token_file_path")
 
+        # Model catalog cache: (monotonic_timestamp, models) or None when empty.
+        self._models_cache_ttl: float = float(
+            self._config.get("models_cache_ttl", DEFAULT_CACHE_TTL_SECONDS)
+        )
+        self._models_cache: tuple[float, list[ModelInfo]] | None = None
+        self._models_lock = asyncio.Lock()
+
         # No persistent client — httpx.AsyncClient is created per-request in complete().
         # This is intentional: token refresh may change headers between calls.
 
@@ -128,16 +96,58 @@ class ChatGPTProvider:
         )
 
     async def list_models(self) -> list[ModelInfo]:
-        """Return ModelInfo objects for all known ChatGPT models."""
-        return [
-            ModelInfo(
-                id=entry["name"],
-                display_name=entry["name"],
-                context_window=entry["context_window"],
-                max_output_tokens=entry["max_output_tokens"],
-            )
-            for entry in CHATGPT_MODELS
-        ]
+        """Return ModelInfo objects for all available ChatGPT models.
+
+        Delegates to :meth:`_get_catalog`, which fetches the live model
+        catalog from the API and caches it for :attr:`_models_cache_ttl`
+        seconds.  Falls back to a built-in list on any error.
+        """
+        return await self._get_catalog()
+
+    async def _get_catalog(self) -> list[ModelInfo]:
+        """Fetch and cache the live model catalog.
+
+        Fast path (no lock): if a non-expired cache entry exists, return it.
+        Slow path (under lock, with double-check): call
+        :func:`~.models.fetch_models`, convert via
+        :func:`~.models.to_model_infos`, and store in cache.
+
+        On *any* exception (network error, auth failure, parse error, …)
+        the fallback catalog is returned and the cache is **not** updated,
+        so the next call will retry the live fetch.
+
+        Returns:
+            List of :class:`~amplifier_core.ModelInfo` objects.
+        """
+        now = time.monotonic()
+
+        # Fast path: return cached catalog if still within TTL.
+        if self._models_cache is not None:
+            cached_at, models = self._models_cache
+            if now - cached_at < self._models_cache_ttl:
+                return models
+
+        async with self._models_lock:
+            # Double-check under lock to avoid redundant fetches.
+            now = time.monotonic()
+            if self._models_cache is not None:
+                cached_at, models = self._models_cache
+                if now - cached_at < self._models_cache_ttl:
+                    return models
+
+            try:
+                await self._ensure_valid_tokens()
+                entries = await fetch_models(
+                    access_token=self._tokens["access_token"],  # type: ignore[index]
+                    account_id=self._tokens["account_id"],  # type: ignore[index]
+                )
+                models = to_model_infos(entries)
+                self._models_cache = (time.monotonic(), models)
+                return models
+            except Exception as exc:
+                logger.warning("Failed to fetch model catalog: %s", exc)
+                # Do not cache the fallback — next call should retry.
+                return to_model_infos(FALLBACK_MODELS)
 
     def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
         """Parse tool calls from a ChatResponse.
