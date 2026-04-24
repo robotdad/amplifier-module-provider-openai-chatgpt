@@ -469,6 +469,61 @@ class TestRefreshTokens:
         assert result is not None
         assert result["account_id"] == "fresh_acc"
 
+    def test_refresh_includes_plan_type_from_new_id_token(self, tmp_path):
+        """plan_type is extracted from the new id_token JWT when present in the refresh response."""
+        from amplifier_module_provider_openai_chatgpt.oauth import refresh_tokens
+
+        token_path = str(tmp_path / "tokens.json")
+        with open(token_path, "w") as f:
+            json.dump({"account_id": "acct_1", "plan_type": "free", "access_token": "old"}, f)
+
+        id_token_jwt = _make_jwt(
+            {"https://api.openai.com/auth": {"chatgpt_plan_type": "pro"}}
+        )
+        mock_async_client = _make_httpx_mock(
+            {
+                "access_token": "new_access",
+                "refresh_token": "new_refresh",
+                "id_token": id_token_jwt,
+                "expires_in": 3600,
+            }
+        )
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.oauth.httpx.AsyncClient",
+            mock_async_client,
+        ):
+            result = asyncio.run(refresh_tokens("test_refresh", path=token_path))
+
+        assert result is not None
+        assert result["plan_type"] == "pro"
+
+    def test_refresh_falls_back_to_disk_plan_type(self, tmp_path):
+        """plan_type falls back to value stored on disk when id_token is absent from the response."""
+        from amplifier_module_provider_openai_chatgpt.oauth import refresh_tokens
+
+        token_path = str(tmp_path / "tokens.json")
+        with open(token_path, "w") as f:
+            json.dump({"account_id": "acct_1", "plan_type": "plus", "access_token": "old"}, f)
+
+        mock_async_client = _make_httpx_mock(
+            {
+                "access_token": "new_access",
+                "refresh_token": "new_refresh",
+                "expires_in": 3600,
+                # no id_token — plan_type must come from disk
+            }
+        )
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.oauth.httpx.AsyncClient",
+            mock_async_client,
+        ):
+            result = asyncio.run(refresh_tokens("test_refresh", path=token_path))
+
+        assert result is not None
+        assert result["plan_type"] == "plus"
+
     def test_refresh_failure_http_401_returns_none(self, tmp_path):
         """HTTP error during refresh causes refresh_tokens to return None."""
         from amplifier_module_provider_openai_chatgpt.oauth import refresh_tokens

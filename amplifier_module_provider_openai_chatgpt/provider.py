@@ -141,11 +141,17 @@ class ChatGPTProvider:
                     access_token=self._tokens["access_token"],  # type: ignore[index]
                     account_id=self._tokens["account_id"],  # type: ignore[index]
                 )
+                if not entries:
+                    raise ValueError("Live model catalog returned 0 usable entries")
                 models = to_model_infos(entries)
                 self._models_cache = (time.monotonic(), models)
                 return models
             except Exception as exc:
-                logger.warning("Failed to fetch model catalog: %s", exc)
+                logger.warning(
+                    "Failed to fetch live model catalog, using fallback: %s",
+                    exc,
+                    exc_info=True,
+                )
                 # Do not cache the fallback — next call should retry.
                 return to_model_infos(FALLBACK_MODELS)
 

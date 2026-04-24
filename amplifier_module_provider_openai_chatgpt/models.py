@@ -18,7 +18,10 @@ from .oauth import CHATGPT_CODEX_BASE_URL
 
 MODELS_ENDPOINT = f"{CHATGPT_CODEX_BASE_URL}/models"
 
-# High client version to bypass client-gating and receive the full catalog.
+# FRAGILE: This relies on the ChatGPT backend treating any unknown high version
+# as "give me everything". If version gating logic changes, catalog fetches will
+# start returning 0 or filtered entries. Symptom: list_models() always returns
+# FALLBACK_MODELS. Check this constant first when debugging catalog issues.
 MODELS_CLIENT_VERSION = "99.99.99"
 
 DEFAULT_CACHE_TTL_SECONDS = 3600

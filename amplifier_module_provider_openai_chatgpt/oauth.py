@@ -259,7 +259,7 @@ async def exchange_code_for_tokens(
 
     Returns:
         Token dict with auth_mode, access_token, refresh_token, id_token, account_id,
-        and expires_at.
+        plan_type, and expires_at.
 
     Raises:
         Exception: Any error from the HTTP request or response parsing propagates up.
@@ -318,6 +318,30 @@ async def exchange_code_for_tokens(
 # ---------------------------------------------------------------------------
 
 
+def _decode_jwt_payload(id_token: str) -> dict | None:
+    """Decode the payload segment of a JWT without signature verification.
+
+    Args:
+        id_token: A JWT string in the form ``header.payload.signature``.
+
+    Returns:
+        Decoded payload dict, or None on any failure (empty input, wrong
+        number of segments, base64 decode error, or JSON parse error).
+    """
+    if not id_token:
+        return None
+    try:
+        parts = id_token.split(".")
+        if len(parts) != 3:
+            return None
+        payload_b64 = parts[1]
+        # Add base64url padding so that len is a multiple of 4.
+        payload_b64 += "=" * ((4 - len(payload_b64) % 4) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload_b64))
+    except Exception:
+        return None
+
+
 def extract_account_id(id_token: str) -> str:
     """Decode a JWT id_token and extract the account ID.
 
@@ -326,8 +350,6 @@ def extract_account_id(id_token: str) -> str:
     inside the ``https://api.openai.com/profile`` custom claim first; falls
     back to the standard ``sub`` claim.
 
-    Adds base64url padding if needed before decoding.
-
     Args:
         id_token: A JWT string in the form ``header.payload.signature``.
 
@@ -335,33 +357,13 @@ def extract_account_id(id_token: str) -> str:
         The account ID string, or an empty string on any failure (empty input,
         malformed JWT, missing claims, decode errors).
     """
-    if not id_token:
+    payload = _decode_jwt_payload(id_token)
+    if payload is None:
         return ""
-
-    try:
-        parts = id_token.split(".")
-        if len(parts) != 3:
-            return ""
-
-        payload_b64 = parts[1]
-        # Add base64url padding so that len is a multiple of 4.
-        padding_needed = (4 - len(payload_b64) % 4) % 4
-        payload_b64 += "=" * padding_needed
-
-        payload_bytes = base64.urlsafe_b64decode(payload_b64)
-        payload = json.loads(payload_bytes)
-
-        # Primary: OpenAI profile custom claim.
-        profile = payload.get("https://api.openai.com/profile")
-        if isinstance(profile, dict):
-            account_id = profile.get("account_id")
-            if account_id:
-                return str(account_id)
-
-        # Fallback: standard subject claim.
-        return str(payload.get("sub", ""))
-    except Exception:
-        return ""
+    profile = payload.get("https://api.openai.com/profile")
+    if isinstance(profile, dict) and profile.get("account_id"):
+        return str(profile["account_id"])
+    return str(payload.get("sub", ""))
 
 
 def extract_plan_type(id_token: str) -> str:
@@ -372,8 +374,6 @@ def extract_plan_type(id_token: str) -> str:
     ``chatgpt_plan_type`` inside the ``https://api.openai.com/auth`` custom
     claim.
 
-    Adds base64url padding if needed before decoding.
-
     Args:
         id_token: A JWT string in the form ``header.payload.signature``.
 
@@ -381,31 +381,13 @@ def extract_plan_type(id_token: str) -> str:
         The plan type string (e.g. ``"pro"``), or an empty string on any
         failure (empty input, malformed JWT, missing claim, decode errors).
     """
-    if not id_token:
+    payload = _decode_jwt_payload(id_token)
+    if payload is None:
         return ""
-
-    try:
-        parts = id_token.split(".")
-        if len(parts) != 3:
-            return ""
-
-        payload_b64 = parts[1]
-        # Add base64url padding so that len is a multiple of 4.
-        padding_needed = (4 - len(payload_b64) % 4) % 4
-        payload_b64 += "=" * padding_needed
-
-        payload_bytes = base64.urlsafe_b64decode(payload_b64)
-        payload = json.loads(payload_bytes)
-
-        auth_claim = payload.get("https://api.openai.com/auth")
-        if isinstance(auth_claim, dict):
-            plan_type = auth_claim.get("chatgpt_plan_type", "")
-            if plan_type:
-                return str(plan_type)
-
-        return ""
-    except Exception:
-        return ""
+    auth_claim = payload.get("https://api.openai.com/auth")
+    if isinstance(auth_claim, dict):
+        return str(auth_claim.get("chatgpt_plan_type", ""))
+    return ""
 
 
 # ---------------------------------------------------------------------------

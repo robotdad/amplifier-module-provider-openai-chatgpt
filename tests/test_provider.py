@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import pytest
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
@@ -1404,3 +1405,50 @@ class TestListModelsDynamic:
         assert mock_fetch.await_count == 2, (
             f"Expected 2 fetches with TTL=0, got {mock_fetch.await_count}"
         )
+
+    # ------------------------------------------------------------------
+    # Empty catalog triggers fallback
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_list_models_falls_back_on_empty_catalog(self) -> None:
+        """When fetch_models returns [], fallback models are returned and cache stays None."""
+        provider = self._make_provider()
+        mock_fetch = AsyncMock(return_value=[])
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
+            mock_fetch,
+        ):
+            result = await provider.list_models()  # type: ignore[union-attr]
+
+        assert len(result) > 0, "Expected non-empty fallback models"
+        # Cache must NOT be populated — next call should retry the live fetch.
+        assert provider._models_cache is None  # type: ignore[union-attr]
+
+    # ------------------------------------------------------------------
+    # Concurrent calls fetch exactly once
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_concurrent_list_models_fetches_once(self) -> None:
+        """5 concurrent list_models() calls result in exactly one fetch_models invocation."""
+        provider = self._make_provider()
+        mock_fetch = AsyncMock(return_value=self._sample_entries())
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.fetch_models",
+            mock_fetch,
+        ):
+            results = await asyncio.gather(
+                provider.list_models(),  # type: ignore[union-attr]
+                provider.list_models(),  # type: ignore[union-attr]
+                provider.list_models(),  # type: ignore[union-attr]
+                provider.list_models(),  # type: ignore[union-attr]
+                provider.list_models(),  # type: ignore[union-attr]
+            )
+
+        mock_fetch.assert_awaited_once()
+        # All 5 callers should receive the same non-empty result.
+        for result in results:
+            assert len(result) > 0
