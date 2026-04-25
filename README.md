@@ -24,18 +24,19 @@ Connects Amplifier to the ChatGPT backend API using OAuth device code authentica
 
 ```toml
 [providers.provider-openai-chatgpt]
-default_model = "o4-mini"
+default_model = "gpt-5.5"
 ```
 
 ### All Config Options
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `default_model` | str | `"gpt-4o"` | Model to use for inference |
+| `default_model` | str | `"gpt-5.5"` | Model to use for inference |
 | `raw` | bool | `false` | Include full request/response payloads in `llm:request`/`llm:response` hook events (for debugging) |
 | `login_on_mount` | bool | `true` | Trigger interactive device code login if tokens are absent or expired. Set `false` for non-interactive environments. |
 | `token_file_path` | str | `~/.amplifier/openai-chatgpt-oauth.json` | Path to the OAuth token JSON file |
 | `timeout` | float | `300.0` | HTTP timeout in seconds for streaming requests |
+| `models_cache_ttl` | float | `3600` | How long (seconds) to cache the live model catalog before re-fetching |
 
 ### Authentication
 
@@ -56,9 +57,12 @@ Works in SSH/headless sessions -- the device code flow only requires a browser o
 - OAuth device code authentication with PKCE (no API key needed)
 - Raw httpx + manual SSE streaming (not the OpenAI SDK)
 - Automatic token refresh with 4-step fallback chain
+- Dynamic model catalog from live API (cached, with fallback)
+- Subscription plan type detection from OAuth JWT
 - Tool calling support
-- Reasoning model support (o4-mini, o3, etc.)
-- `-fast` model suffix support (e.g. `o4-mini-fast` -> `o4-mini` with `service_tier: "priority"`)
+- Reasoning effort support (`low`/`medium`/`high`/`xhigh` on all gpt-5.x models)
+- `-fast` model suffix support (e.g. `gpt-5.5-fast` -> `gpt-5.5` with `service_tier: "priority"`)
+- Production routing matrix for all 13 Amplifier agent roles
 - `llm:request`/`llm:response` hook events with optional raw payload inclusion
 
 ## Local Development
@@ -116,7 +120,7 @@ providers:
   - module: provider-openai-chatgpt
     source: /path/to/amplifier-module-provider-openai-chatgpt
     config:
-      default_model: o4-mini
+      default_model: gpt-5.5
 ---
 
 # Test: provider-openai-chatgpt
@@ -128,46 +132,57 @@ amplifier run --bundle ./test-chatgpt.md "Hello, can you hear me?"
 
 ## Routing Matrix
 
-If you use Amplifier's routing matrix, the default matrices reference `provider: openai` which does **not** match this module's name (`provider-openai-chatgpt`). A test routing matrix is included in this repo at `routing/openai-chatgpt-test.yaml`.
+This module ships with a production routing matrix at `routing/openai-chatgpt.yaml` that maps all 13 Amplifier agent roles to the correct models. This is **required** for agent delegation to work -- without it, agents like `web-research`, `explorer`, and `zen-architect` will fail to resolve a provider.
 
 To use it:
 
 ```bash
 # Copy to your user routing directory
-cp routing/openai-chatgpt-test.yaml ~/.amplifier/routing/
+cp routing/openai-chatgpt.yaml ~/.amplifier/routing/
 
 # Activate it
-amplifier routing use openai-chatgpt-test
+amplifier routing use openai-chatgpt
 
 # Verify
 amplifier routing show
-
-# Switch back when done
-amplifier routing use balanced
 ```
 
-See [amplifier-support#212](https://github.com/microsoft-amplifier/amplifier-support/issues/212) for the upstream issue about provider name matching.
+The matrix uses two-tier fallback chains (gpt-5.5 -> gpt-5.4) so it works across subscription tiers. Role highlights:
+
+| Role | Primary Model | Config |
+|------|--------------|--------|
+| `general`, `creative`, `writing`, `vision` | gpt-5.5 | -- |
+| `fast` | gpt-?.?-mini* (glob) | -- |
+| `coding` | gpt-?.?-codex* (glob) | -- |
+| `reasoning`, `research`, `security-audit`, `critical-ops` | gpt-5.5 | `reasoning_effort: high` |
+| `critique` | gpt-5.5 | `reasoning_effort: xhigh` |
+
+See the matrix YAML header for full documentation on glob strategy, fallback philosophy, and differences from the standard `openai` routing matrix.
 
 ## Supported Models
 
-| Model | Context Window | Max Output |
-|-------|---------------|------------|
-| gpt-5.4, gpt-5.4-pro, gpt-5.4-fast, gpt-5.4-mini | 272K-400K | 128K |
-| gpt-5.3-codex, gpt-5.3-codex-spark | 128K-272K | 128K |
-| gpt-5.2, gpt-5.2-codex | 272K | 128K |
-| gpt-5.1, gpt-5.1-codex, gpt-5.1-codex-mini, gpt-5.1-codex-max | 272K | 128K |
-| gpt-5-codex-mini | 272K | 128K |
-| gpt-4o, gpt-4o-mini | 128K | 16K |
-| o1, o1-pro, o3, o3-mini, o4-mini | 200K | 100K |
+The model catalog is fetched dynamically from the ChatGPT backend API at `GET /backend-api/codex/models`. Available models depend on your subscription tier. The catalog is cached for 1 hour (configurable via `models_cache_ttl`).
 
-Append `-fast` to any model name (e.g. `gpt-5.4-fast`) to strip the suffix and set `service_tier: "priority"`.
+Example catalog for a **Plus** subscription (as of April 2026):
+
+| Model | Context Window | Priority | Speed Tiers | Reasoning |
+|-------|---------------|----------|-------------|-----------|
+| gpt-5.5 | 272K | 0 (highest) | fast | low/med/high/xhigh |
+| gpt-5.4 | 272K | 2 | fast | low/med/high/xhigh |
+| gpt-5.4-mini | 272K | 4 | -- | low/med/high/xhigh |
+| gpt-5.3-codex | 272K | 6 | -- | low/med/high/xhigh |
+| gpt-5.2 | 272K | 10 | -- | low/med/high/xhigh |
+
+Models with a "fast" speed tier support a `-fast` suffix (e.g. `gpt-5.5-fast`) which maps to `service_tier: "priority"` in the request. This consumes priority quota faster.
+
+If the live API is unreachable, a minimal fallback catalog (gpt-5.2, gpt-5.2-codex, gpt-4o) is used. The fallback is not cached, so the next `list_models()` call retries the live API.
 
 ## Known Limitations
 
-- **No retry logic** -- transient 5xx or network errors fail immediately. Retry/backoff is planned.
+- **No mid-session 401 retry** -- if the access token expires mid-session, the current request fails. Automatic retry after token refresh is planned.
 - **No `response.incomplete` continuation** -- if a reasoning model hits its output limit, the partial response is lost. Auto-continuation is planned.
 - **Streaming is mandatory** -- the ChatGPT backend requires `stream=True`. The provider always streams internally but returns a complete `ChatResponse` to the orchestrator.
-- **Static model catalog** -- new models require a code update. No dynamic model discovery.
+- **No `response.content_part.delta` handling** -- only `response.output_item.done` events are accumulated. Streaming delta forwarding is planned.
 
 ## Dependencies
 
