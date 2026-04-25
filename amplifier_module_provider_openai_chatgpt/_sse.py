@@ -45,11 +45,14 @@ class ParsedResponse:
     raw_events: list[dict] = field(default_factory=list)
 
 
-def parse_sse_events(lines: list[str]) -> ParsedResponse:
+def parse_sse_events(lines: list[str], collect_raw: bool = False) -> ParsedResponse:
     """Parse a list of raw SSE lines into a ParsedResponse.
 
     Args:
-        lines: Raw SSE lines (as returned by an HTTP response body iterator).
+        lines:       Raw SSE lines (as returned by an HTTP response body iterator).
+        collect_raw: When True, populate ``ParsedResponse.raw_events`` with every
+                     successfully parsed JSON event.  Defaults to False to avoid
+                     the memory overhead in normal production usage.
 
     Returns:
         ParsedResponse with accumulated content, tool calls, and metadata.
@@ -77,7 +80,8 @@ def parse_sse_events(lines: list[str]) -> ParsedResponse:
         except json.JSONDecodeError:
             continue
 
-        result.raw_events.append(event)
+        if collect_raw:
+            result.raw_events.append(event)
 
         event_type = event.get("type", "")
 

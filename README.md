@@ -179,7 +179,7 @@ If the live API is unreachable, a minimal fallback catalog (gpt-5.2, gpt-5.2-cod
 
 ## Known Limitations
 
-- **No mid-session 401 retry** -- if the access token expires mid-session, the current request fails. Automatic retry after token refresh is planned.
+- **Automatic mid-session 401 recovery** -- if the access token expires mid-session, the provider performs one silent token refresh and retries the request automatically. A second consecutive 401 raises `AuthenticationError`.
 - **No `response.incomplete` continuation** -- if a reasoning model hits its output limit, the partial response is lost. Auto-continuation is planned.
 - **Streaming is mandatory** -- the ChatGPT backend requires `stream=True`. The provider always streams internally but returns a complete `ChatResponse` to the orchestrator.
 - **No `response.content_part.delta` handling** -- only `response.output_item.done` events are accumulated. Streaming delta forwarding is planned.

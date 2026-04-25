@@ -179,6 +179,15 @@ class TestToModelInfos:
         assert len(result) == 1
         assert result[0].id == "gpt-4o"
 
+    def test_fallback_first_entry_is_gpt_55(self) -> None:
+        """FALLBACK_MODELS first entry must be gpt-5.5 (most-capable current model)."""
+        from amplifier_module_provider_openai_chatgpt.models import FALLBACK_MODELS
+
+        assert len(FALLBACK_MODELS) > 0, "FALLBACK_MODELS must not be empty"
+        assert FALLBACK_MODELS[0]["slug"] == "gpt-5.5", (
+            f"Expected gpt-5.5 as first fallback entry, got {FALLBACK_MODELS[0]['slug']!r}"
+        )
+
     def test_fallback_models_round_trip(self) -> None:
         """FALLBACK_MODELS through to_model_infos produces valid ModelInfo objects."""
         from amplifier_core import ModelInfo

@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 
 from amplifier_core import ModelInfo, ProviderInfo
+from amplifier_core import llm_errors as kernel_errors
 from amplifier_core.message_models import (
     ChatRequest,
     ChatResponse,
@@ -27,7 +28,7 @@ from amplifier_core.message_models import (
 )
 from amplifier_core.utils import redact_secrets
 
-from ._sse import ParsedResponse, parse_sse_events
+from ._sse import ParsedResponse, SSEError, parse_sse_events
 from .models import (
     DEFAULT_CACHE_TTL_SECONDS,
     FALLBACK_MODELS,
@@ -45,6 +46,33 @@ logger = logging.getLogger(__name__)
 
 # Full endpoint for the ChatGPT Responses API
 CHATGPT_CODEX_ENDPOINT = CHATGPT_CODEX_BASE_URL + "/responses"
+
+
+# ---------------------------------------------------------------------------
+# GPT-5.5-pro effort validator
+# ---------------------------------------------------------------------------
+
+_GPT_5_5_PRO_ALLOWED_EFFORTS = frozenset({"medium", "high", "xhigh"})
+
+
+def _validate_gpt_5_5_pro_effort(model_id: str, reasoning_param: Any) -> None:
+    """Pre-flight: reject effort below 'medium' for gpt-5.5-pro models."""
+    if not model_id.startswith("gpt-5.5-pro"):
+        return
+    if reasoning_param is None:
+        return
+    # Handle both string ("low") and dict ({"effort": "low"}) forms
+    if isinstance(reasoning_param, dict):
+        effort = reasoning_param.get("effort")
+    else:
+        effort = reasoning_param
+    if effort is None or effort in _GPT_5_5_PRO_ALLOWED_EFFORTS:
+        return
+    raise kernel_errors.InvalidRequestError(
+        f"gpt-5.5-pro requires reasoning effort of 'medium' or above, "
+        f"got '{effort}'. Allowed values: {['medium', 'high', 'xhigh']}",
+        provider="openai-chatgpt",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +97,7 @@ class ChatGPTProvider:
 
         self.priority: int = int(self._config.get("priority", 100))
         self.raw: bool = bool(self._config.get("raw", False))
-        self.default_model: str = self._config.get("default_model", "gpt-4o")
+        self.default_model: str = self._config.get("default_model", "gpt-5.5")
         self.timeout: float = float(self._config.get("timeout", 300.0))
         self._token_file_path: str | None = self._config.get("token_file_path")
 
@@ -224,6 +252,9 @@ class ChatGPTProvider:
             model = model.removesuffix("-fast")
             service_tier = "priority"
 
+        # Pre-flight: validate effort level for gpt-5.5-pro models
+        _validate_gpt_5_5_pro_effort(model, request.reasoning_effort)
+
         # Build input array and extract instructions from system/developer message
         instructions: str | None = None
         input_items: list[dict[str, Any]] = []
@@ -359,15 +390,26 @@ class ChatGPTProvider:
             Dict with six required headers.
 
         Raises:
-            ValueError: If ``access_token`` is absent or ``_tokens`` is None.
-            ValueError: If ``account_id`` is absent.
+            kernel_errors.AuthenticationError: If ``access_token`` is absent
+                or ``_tokens`` is None.
+            kernel_errors.AuthenticationError: If ``account_id`` is absent.
         """
         if not self._tokens or not self._tokens.get("access_token"):
-            raise ValueError("No valid OAuth tokens available")
+            raise kernel_errors.AuthenticationError(
+                "No valid OAuth tokens available",
+                provider=self.name,
+                status_code=401,
+                retryable=False,
+            )
 
         account_id = self._tokens.get("account_id")
         if not account_id:
-            raise ValueError("No account_id in tokens — cannot build request headers")
+            raise kernel_errors.AuthenticationError(
+                "No account_id in tokens — cannot build request headers",
+                provider=self.name,
+                status_code=401,
+                retryable=False,
+            )
 
         return {
             "Authorization": f"Bearer {self._tokens['access_token']}",
@@ -381,6 +423,152 @@ class ChatGPTProvider:
     async def close(self) -> None:
         """No-op — httpx clients are created per-request in complete()."""
 
+    @staticmethod
+    def _is_cloudflare_challenge(headers: httpx.Headers, body: bytes) -> bool:
+        """Detect a Cloudflare browser-challenge HTML page in a 403 response.
+
+        Args:
+            headers: Response headers from the HTTP response.
+            body: Raw response body bytes.
+
+        Returns:
+            True if the response looks like a Cloudflare challenge page.
+        """
+        # Primary signal: HTML content-type header.
+        ct = headers.get("content-type", "").lower()
+        if "text/html" in ct:
+            return True
+
+        # Fallback: scan body for known Cloudflare challenge markers.
+        body_lower = body.decode(errors="replace").lower()
+        cf_markers = (
+            "just a moment",
+            "cf-browser-verification",
+            "checking if the site connection is secure",
+        )
+        return any(marker in body_lower for marker in cf_markers)
+
+    @staticmethod
+    def _raise_for_status(
+        status: int,
+        headers: httpx.Headers,
+        body: bytes,
+        provider_name: str,
+    ) -> None:
+        """Map a non-200, non-401 HTTP response to the correct kernel error.
+
+        401 handling is intentionally excluded: it lives in the retry loop in
+        ``complete()`` because it needs to control retry flow.
+
+        Always raises; never returns normally.
+
+        Args:
+            status: HTTP status code.
+            headers: Response headers.
+            body: Raw response body bytes.
+            provider_name: Provider name string for error context.
+
+        Raises:
+            kernel_errors.RateLimitError: 429.
+            kernel_errors.ContextLengthError: 400 with context-length keywords.
+            kernel_errors.ContentFilterError: 400 with content-filter keywords.
+            kernel_errors.InvalidRequestError: 400 without special keywords.
+            kernel_errors.ProviderUnavailableError: 403 Cloudflare challenge or 5xx.
+            kernel_errors.AccessDeniedError: 403 non-Cloudflare.
+            kernel_errors.NotFoundError: 404.
+            kernel_errors.LLMError: Any other unexpected status code.
+        """
+        body_text = body.decode(errors="replace")
+
+        if status == 429:
+            retry_after: float | None = None
+            ra_header = headers.get("retry-after")
+            if ra_header is not None:
+                try:
+                    retry_after = float(ra_header)
+                except ValueError:
+                    pass
+            raise kernel_errors.RateLimitError(
+                f"ChatGPT API rate limit exceeded ({status}): {body_text}",
+                provider=provider_name,
+                status_code=status,
+                retryable=True,
+                retry_after=retry_after,
+            )
+        elif status == 400:
+            body_lower = body_text.lower()
+            if any(
+                kw in body_lower
+                for kw in (
+                    "context length",
+                    "too many tokens",
+                    "maximum context",
+                )
+            ):
+                raise kernel_errors.ContextLengthError(
+                    f"ChatGPT API context length exceeded ({status}): {body_text}",
+                    provider=provider_name,
+                    status_code=status,
+                    retryable=False,
+                )
+            elif any(
+                kw in body_lower
+                for kw in (
+                    "content filter",
+                    "safety",
+                    "blocked",
+                )
+            ):
+                raise kernel_errors.ContentFilterError(
+                    f"ChatGPT API content filtered ({status}): {body_text}",
+                    provider=provider_name,
+                    status_code=status,
+                    retryable=False,
+                )
+            else:
+                raise kernel_errors.InvalidRequestError(
+                    f"ChatGPT API invalid request ({status}): {body_text}",
+                    provider=provider_name,
+                    status_code=status,
+                    retryable=False,
+                )
+        elif status == 403:
+            if ChatGPTProvider._is_cloudflare_challenge(headers, body):
+                raise kernel_errors.ProviderUnavailableError(
+                    f"ChatGPT API blocked by Cloudflare challenge ({status})",
+                    provider=provider_name,
+                    status_code=status,
+                    retryable=True,
+                )
+            else:
+                raise kernel_errors.AccessDeniedError(
+                    f"ChatGPT API access denied ({status}): {body_text}",
+                    provider=provider_name,
+                    status_code=status,
+                    retryable=False,
+                )
+        elif status == 404:
+            raise kernel_errors.NotFoundError(
+                f"ChatGPT API endpoint not found ({status}): {body_text}",
+                provider=provider_name,
+                status_code=status,
+                retryable=False,
+            )
+        elif status >= 500:
+            raise kernel_errors.ProviderUnavailableError(
+                f"ChatGPT API server error ({status}): {body_text}",
+                provider=provider_name,
+                status_code=status,
+                retryable=True,
+            )
+        else:
+            raise kernel_errors.LLMError(
+                f"ChatGPT API error ({status}): {body_text}",
+                provider=provider_name,
+                status_code=status,
+                retryable=False,
+            )
+
     async def _ensure_valid_tokens(self) -> None:
         """Guarantee ``self._tokens`` holds a valid, unexpired access token.
 
@@ -389,10 +577,11 @@ class ChatGPTProvider:
         2. Tokens loaded from disk pass ``is_token_valid()`` → update in-memory, done.
         3. Refresh using in-memory ``refresh_token`` → update in-memory, done.
         4. Refresh using disk ``refresh_token`` → update in-memory, done.
-        5. None of the above succeeded → raise ``ValueError``.
+        5. None of the above succeeded → raise ``AuthenticationError``.
 
         Raises:
-            ValueError: If no valid tokens can be obtained by any means.
+            kernel_errors.AuthenticationError: If no valid tokens can be
+                obtained by any means.
         """
         # 1. In-memory tokens still valid.
         if is_token_valid(self._tokens):
@@ -422,8 +611,10 @@ class ChatGPTProvider:
                 self._tokens = refreshed
                 return
 
-        raise ValueError(
-            "No valid OAuth tokens available — please run the login flow again"
+        raise kernel_errors.AuthenticationError(
+            "No valid OAuth tokens available — please run the login flow again",
+            provider=self.name,
+            retryable=False,
         )
 
     async def complete(self, request: ChatRequest, **kwargs: Any) -> ChatResponse:
@@ -432,15 +623,17 @@ class ChatGPTProvider:
         Flow:
         1. Ensure valid OAuth tokens.
         2. Build request payload.
-        3. Emit ``llm:request`` event.
+        3. Emit ``llm:request`` event (once — NOT re-emitted on retry).
         4. POST to CHATGPT_CODEX_ENDPOINT with httpx streaming, collect SSE lines.
-        5. Check HTTP status (non-200 raises ValueError).
+           On 401, attempt one token refresh and retry before propagating the error.
+        5. Check HTTP status — map to kernel_errors subtypes.
         6. Parse SSE events.
         7. Emit ``llm:response`` event with usage and timing.
         8. Return ChatResponse via ``_to_chat_response()``.
 
         On any exception an ``llm:response`` event with ``status='error'`` is
-        emitted before re-raising.
+        emitted before re-raising.  All exceptions that escape this method are
+        :class:`~amplifier_core.llm_errors.LLMError` subtypes.
         """
         # 1. Ensure valid OAuth tokens.
         await self._ensure_valid_tokens()
@@ -455,7 +648,7 @@ class ChatGPTProvider:
 
         headers = self._build_headers()
 
-        # 3. Emit llm:request event.
+        # 3. Emit llm:request event (NOT re-emitted on retry).
         _has_hooks = self._coordinator and hasattr(self._coordinator, "hooks")
         if _has_hooks:
             req_event: dict[str, Any] = {
@@ -469,28 +662,66 @@ class ChatGPTProvider:
 
         start_time = time.monotonic()
 
+        # Local guard variable — concurrency-safe (no instance-level mutation).
+        retry_attempted = False
+
         try:
-            # 4. POST with httpx streaming, collect SSE lines.
+            # 4. Two-attempt loop: first attempt + one optional retry on 401.
             lines: list[str] = []
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                async with client.stream(
-                    "POST",
-                    CHATGPT_CODEX_ENDPOINT,
-                    json=payload,
-                    headers=headers,
-                ) as resp:
-                    # 5. Check HTTP status.
-                    if resp.status_code != 200:
-                        error_body = await resp.aread()
-                        raise ValueError(
-                            f"ChatGPT API error {resp.status_code}: "
-                            f"{error_body.decode(errors='replace')}"
-                        )
-                    async for line in resp.aiter_lines():
-                        lines.append(line)
+            for _attempt in range(2):
+                lines = []
+                try:
+                    async with httpx.AsyncClient(timeout=self.timeout) as client:
+                        async with client.stream(
+                            "POST",
+                            CHATGPT_CODEX_ENDPOINT,
+                            json=payload,
+                            headers=headers,
+                        ) as resp:
+                            # 5. Check HTTP status — map to kernel error types.
+                            if resp.status_code != 200:
+                                error_body = await resp.aread()
+                                status = resp.status_code
+
+                                if status == 401 and not retry_attempted:
+                                    # Mid-session expiry: refresh once, rebuild
+                                    # headers, and retry.  The llm:request hook
+                                    # is NOT re-emitted.
+                                    retry_attempted = True
+                                    await self._ensure_valid_tokens()
+                                    headers = self._build_headers()
+                                    continue  # re-enter the for loop
+                                elif status == 401:
+                                    body_text = error_body.decode(errors="replace")
+                                    raise kernel_errors.AuthenticationError(
+                                        f"ChatGPT API authentication failed ({status}): {body_text}",
+                                        provider=self.name,
+                                        status_code=status,
+                                        retryable=False,
+                                    )
+                                else:
+                                    # All other non-2xx codes — delegate to the
+                                    # status-dispatch method (429, 400, 403, 404,
+                                    # 5xx, other).
+                                    self._raise_for_status(
+                                        status, resp.headers, error_body, self.name
+                                    )
+
+                            async for line in resp.aiter_lines():
+                                lines.append(line)
+
+                    break  # request succeeded — exit the retry loop
+
+                except kernel_errors.AuthenticationError:
+                    # Belt-and-suspenders: catch any AuthenticationError that
+                    # escaped the status-code block (e.g. _build_headers()
+                    # raising during the mid-loop 401 recovery path). By the
+                    # time we reach this handler retry_attempted is always
+                    # True, so we simply propagate.
+                    raise
 
             # 6. Parse SSE events.
-            parsed = parse_sse_events(lines)
+            parsed = parse_sse_events(lines, collect_raw=self.raw)
 
             duration_ms = (time.monotonic() - start_time) * 1000
 
@@ -513,7 +744,8 @@ class ChatGPTProvider:
             # 8. Return ChatResponse.
             return self._to_chat_response(parsed, model)
 
-        except Exception as exc:
+        except kernel_errors.LLMError as exc:
+            # Already a typed kernel error — emit hook and re-raise unchanged.
             duration_ms = (time.monotonic() - start_time) * 1000
             if _has_hooks:
                 await self._coordinator.hooks.emit(
@@ -527,6 +759,104 @@ class ChatGPTProvider:
                     },
                 )
             raise
+
+        except SSEError as exc:
+            # Map SSE-layer errors to kernel types before escaping complete().
+            duration_ms = (time.monotonic() - start_time) * 1000
+            code = exc.code or ""
+            msg = str(exc).lower()
+
+            if "rate_limit" in code:
+                mapped_exc: kernel_errors.LLMError = kernel_errors.RateLimitError(
+                    str(exc), provider=self.name, retryable=True
+                )
+            elif any(kw in msg for kw in ("context length", "too many tokens")):
+                mapped_exc = kernel_errors.ContextLengthError(
+                    str(exc), provider=self.name, retryable=False
+                )
+            elif any(kw in msg for kw in ("content filter", "safety", "blocked")):
+                mapped_exc = kernel_errors.ContentFilterError(
+                    str(exc), provider=self.name, retryable=False
+                )
+            else:
+                mapped_exc = kernel_errors.LLMError(
+                    str(exc), provider=self.name, retryable=False
+                )
+
+            if _has_hooks:
+                await self._coordinator.hooks.emit(
+                    "llm:response",
+                    {
+                        "provider": self.name,
+                        "model": model,
+                        "status": "error",
+                        "error": str(exc),
+                        "duration_ms": duration_ms,
+                    },
+                )
+            raise mapped_exc from exc
+
+        except httpx.TimeoutException as exc:
+            # Timeout → LLMTimeoutError (retryable).
+            duration_ms = (time.monotonic() - start_time) * 1000
+            mapped_timeout = kernel_errors.LLMTimeoutError(
+                f"ChatGPT API request timed out: {exc}",
+                provider=self.name,
+                retryable=True,
+            )
+            if _has_hooks:
+                await self._coordinator.hooks.emit(
+                    "llm:response",
+                    {
+                        "provider": self.name,
+                        "model": model,
+                        "status": "error",
+                        "error": str(exc),
+                        "duration_ms": duration_ms,
+                    },
+                )
+            raise mapped_timeout from exc
+
+        except httpx.TransportError as exc:
+            # Transport / connection errors → ProviderUnavailableError (retryable).
+            # Covers ConnectError, RemoteProtocolError, and other transport
+            # failures. Note: TimeoutException is a separate hierarchy caught above.
+            duration_ms = (time.monotonic() - start_time) * 1000
+            mapped_unavail = kernel_errors.ProviderUnavailableError(
+                f"ChatGPT API connection error: {exc}",
+                provider=self.name,
+                retryable=True,
+            )
+            if _has_hooks:
+                await self._coordinator.hooks.emit(
+                    "llm:response",
+                    {
+                        "provider": self.name,
+                        "model": model,
+                        "status": "error",
+                        "error": str(exc),
+                        "duration_ms": duration_ms,
+                    },
+                )
+            raise mapped_unavail from exc
+
+        except Exception as exc:
+            # Catch-all: wrap in LLMError so callers always receive a typed error.
+            duration_ms = (time.monotonic() - start_time) * 1000
+            if _has_hooks:
+                await self._coordinator.hooks.emit(
+                    "llm:response",
+                    {
+                        "provider": self.name,
+                        "model": model,
+                        "status": "error",
+                        "error": str(exc),
+                        "duration_ms": duration_ms,
+                    },
+                )
+            raise kernel_errors.LLMError(
+                str(exc), provider=self.name, retryable=False
+            ) from exc
 
     def _to_chat_response(self, parsed: ParsedResponse, model: str) -> ChatResponse:
         """Convert a ``ParsedResponse`` into an Amplifier ``ChatResponse``.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import pytest
+import httpx
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 # ---------------------------------------------------------------------------
@@ -26,11 +27,13 @@ class TestFallbackCatalog:
         for entry in FALLBACK_MODELS:
             assert "slug" in entry, f"Missing 'slug' in {entry}"
 
-    def test_fallback_contains_gpt_4o(self) -> None:
+    def test_fallback_first_entry_is_gpt_55(self) -> None:
         from amplifier_module_provider_openai_chatgpt.models import FALLBACK_MODELS
 
-        slugs = [m["slug"] for m in FALLBACK_MODELS]
-        assert "gpt-4o" in slugs
+        assert len(FALLBACK_MODELS) > 0, "FALLBACK_MODELS must not be empty"
+        assert FALLBACK_MODELS[0]["slug"] == "gpt-5.5", (
+            f"Expected gpt-5.5 as first fallback entry, got {FALLBACK_MODELS[0]['slug']!r}"
+        )
 
     def test_fallback_contains_gpt_52(self) -> None:
         from amplifier_module_provider_openai_chatgpt.models import FALLBACK_MODELS
@@ -597,24 +600,34 @@ class TestBuildHeaders:
     # Error cases
     # ------------------------------------------------------------------
 
-    def test_missing_access_token_raises_value_error(self) -> None:
-        """Missing access_token raises ValueError with 'No valid OAuth tokens'."""
+    def test_missing_access_token_raises_auth_error(self) -> None:
+        """Missing access_token raises AuthenticationError with 'No valid OAuth tokens'."""
+        from amplifier_core import llm_errors as kernel_errors
+
         tokens = {"account_id": "acct-123"}  # no access_token
         provider = self._make_provider(tokens=tokens)
-        with pytest.raises(ValueError, match="No valid OAuth tokens"):
+        with pytest.raises(
+            kernel_errors.AuthenticationError, match="No valid OAuth tokens"
+        ):
             provider._build_headers()  # type: ignore[union-attr]
 
-    def test_none_tokens_raises_value_error(self) -> None:
-        """tokens=None raises ValueError with 'No valid OAuth tokens'."""
+    def test_none_tokens_raises_auth_error(self) -> None:
+        """tokens=None raises AuthenticationError with 'No valid OAuth tokens'."""
+        from amplifier_core import llm_errors as kernel_errors
+
         provider = self._make_provider(tokens=None)
-        with pytest.raises(ValueError, match="No valid OAuth tokens"):
+        with pytest.raises(
+            kernel_errors.AuthenticationError, match="No valid OAuth tokens"
+        ):
             provider._build_headers()  # type: ignore[union-attr]
 
-    def test_missing_account_id_raises_value_error(self) -> None:
-        """Missing account_id raises ValueError mentioning 'account_id'."""
+    def test_missing_account_id_raises_auth_error(self) -> None:
+        """Missing account_id raises AuthenticationError mentioning 'account_id'."""
+        from amplifier_core import llm_errors as kernel_errors
+
         tokens = {"access_token": "test-access-tok"}  # no account_id
         provider = self._make_provider(tokens=tokens)
-        with pytest.raises(ValueError, match="account_id"):
+        with pytest.raises(kernel_errors.AuthenticationError, match="account_id"):
             provider._build_headers()  # type: ignore[union-attr]
 
 
@@ -697,16 +710,24 @@ def _make_sse_lines(
 class _MockStreamResponse:
     """Async mock for an httpx streaming response."""
 
-    def __init__(self, lines: list[str], status_code: int = 200) -> None:
+    def __init__(
+        self,
+        lines: list[str],
+        status_code: int = 200,
+        headers: dict | None = None,
+        error_body: bytes = b"HTTP error body",
+    ) -> None:
         self.status_code = status_code
         self._lines = lines
+        self.headers = httpx.Headers(headers or {})
+        self._error_body = error_body
 
     async def aiter_lines(self):  # type: ignore[return]
         for line in self._lines:
             yield line
 
     async def aread(self) -> bytes:
-        return b"HTTP error body"
+        return self._error_body
 
 
 class _AsyncCM:
@@ -722,7 +743,12 @@ class _AsyncCM:
         pass
 
 
-def _make_sse_response(lines: list[str], status_code: int = 200) -> "_AsyncCM":
+def _make_sse_response(
+    lines: list[str],
+    status_code: int = 200,
+    headers: dict | None = None,
+    error_body: bytes = b"HTTP error body",
+) -> "_AsyncCM":
     """Return an async-context-manager mock for httpx.AsyncClient.
 
     Usage::
@@ -731,7 +757,9 @@ def _make_sse_response(lines: list[str], status_code: int = 200) -> "_AsyncCM":
             MockClient.return_value = _make_sse_response(lines)
             result = await provider.complete(request)
     """
-    response = _MockStreamResponse(lines, status_code)
+    response = _MockStreamResponse(
+        lines, status_code, headers=headers, error_body=error_body
+    )
     mock_client = MagicMock()
     mock_client.stream.return_value = _AsyncCM(response)
     return _AsyncCM(mock_client)
@@ -1149,7 +1177,8 @@ class TestCompleteErrors:
 
     @pytest.mark.asyncio
     async def test_sse_error_event_emits_error_status_then_raises(self) -> None:
-        """SSE error event inside stream emits llm:response with status='error', then raises SSEError."""
+        """SSE error event inside stream emits llm:response with status='error', then raises LLMError."""
+        from amplifier_core import llm_errors as kernel_errors
         from amplifier_module_provider_openai_chatgpt._sse import SSEError
 
         provider = self._make_provider_with_tokens()
@@ -1174,8 +1203,11 @@ class TestCompleteErrors:
             "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
         ) as MockClient:
             MockClient.return_value = _make_sse_response(error_lines)
-            with pytest.raises(SSEError):
+            with pytest.raises(kernel_errors.LLMError) as exc_info:
                 await provider.complete(request)  # type: ignore[union-attr]
+
+        # SSEError must never escape complete() unmapped
+        assert not isinstance(exc_info.value, SSEError)
 
         coordinator = provider._coordinator  # type: ignore[union-attr]
         calls = coordinator.hooks.emit.call_args_list
@@ -1189,8 +1221,9 @@ class TestCompleteErrors:
         )
 
     @pytest.mark.asyncio
-    async def test_missing_tokens_raises_value_error(self) -> None:
-        """Provider with no valid tokens raises ValueError before making any HTTP request."""
+    async def test_missing_tokens_raises_auth_error(self) -> None:
+        """Provider with no valid tokens raises AuthenticationError before making any HTTP request."""
+        from amplifier_core import llm_errors as kernel_errors
         from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
 
         coordinator = MagicMock()
@@ -1200,11 +1233,13 @@ class TestCompleteErrors:
         )
         request = self._make_request()
 
+        # Patch the name bound in provider.py's namespace so _ensure_valid_tokens()
+        # sees None for every disk-load attempt and raises AuthenticationError.
         with patch(
-            "amplifier_module_provider_openai_chatgpt.oauth.load_tokens",
+            "amplifier_module_provider_openai_chatgpt.provider.load_tokens",
             return_value=None,
         ):
-            with pytest.raises(ValueError):
+            with pytest.raises(kernel_errors.AuthenticationError):
                 await provider.complete(request)  # type: ignore[union-attr]
 
 
@@ -1452,3 +1487,708 @@ class TestListModelsDynamic:
         # All 5 callers should receive the same non-empty result.
         for result in results:
             assert len(result) > 0
+
+
+# ---------------------------------------------------------------------------
+# TestCompleteErrorMapping — HTTP status codes and exceptions → kernel errors
+# ---------------------------------------------------------------------------
+
+
+class TestCompleteErrorMapping:
+    """Verify that every non-200 status code and transport exception
+    escapes complete() as the expected kernel_errors subtype."""
+
+    def _make_provider(self) -> object:
+        from datetime import datetime, timedelta, timezone
+
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        expires_at = (datetime.now(tz=timezone.utc) + timedelta(hours=1)).isoformat()
+        tokens = {
+            "access_token": "test-access-token",
+            "account_id": "acct-123",
+            "expires_at": expires_at,
+        }
+        coordinator = MagicMock()
+        coordinator.hooks.emit = AsyncMock()
+        return ChatGPTProvider({"default_model": "gpt-4o"}, coordinator, tokens)
+
+    def _make_request(self) -> object:  # type: ignore[return]
+        from amplifier_core.message_models import ChatRequest, Message
+
+        return ChatRequest(messages=[Message(role="user", content="hello")])
+
+    # ------------------------------------------------------------------
+    # HTTP 401 → AuthenticationError
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_401_raises_auth_error(self) -> None:
+        """HTTP 401 → AuthenticationError(retryable=False)."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request()
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(
+                [], status_code=401, error_body=b'{"error": "unauthorized"}'
+            )
+            with pytest.raises(kernel_errors.AuthenticationError) as exc_info:
+                await provider.complete(request)  # type: ignore[union-attr]
+
+        assert exc_info.value.retryable is False
+        assert exc_info.value.status_code == 401
+
+    # ------------------------------------------------------------------
+    # HTTP 429 → RateLimitError (with optional Retry-After)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_429_raises_rate_limit(self) -> None:
+        """HTTP 429 → RateLimitError(retryable=True)."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request()
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(
+                [], status_code=429, error_body=b'{"error": "rate limit exceeded"}'
+            )
+            with pytest.raises(kernel_errors.RateLimitError) as exc_info:
+                await provider.complete(request)  # type: ignore[union-attr]
+
+        assert exc_info.value.retryable is True
+        assert exc_info.value.status_code == 429
+
+    @pytest.mark.asyncio
+    async def test_429_extracts_retry_after_header(self) -> None:
+        """HTTP 429 with Retry-After header → RateLimitError.retry_after set."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request()
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(
+                [],
+                status_code=429,
+                headers={"retry-after": "30"},
+                error_body=b'{"error": "rate limit exceeded"}',
+            )
+            with pytest.raises(kernel_errors.RateLimitError) as exc_info:
+                await provider.complete(request)  # type: ignore[union-attr]
+
+        assert exc_info.value.retry_after == 30.0
+
+    # ------------------------------------------------------------------
+    # HTTP 500 → ProviderUnavailableError
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_500_raises_provider_unavailable(self) -> None:
+        """HTTP 500 → ProviderUnavailableError(retryable=True)."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request()
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(
+                [], status_code=500, error_body=b"Internal Server Error"
+            )
+            with pytest.raises(kernel_errors.ProviderUnavailableError) as exc_info:
+                await provider.complete(request)  # type: ignore[union-attr]
+
+        assert exc_info.value.retryable is True
+        assert exc_info.value.status_code == 500
+
+    # ------------------------------------------------------------------
+    # HTTP 403 — Cloudflare vs real 403
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_cloudflare_403_detected(self) -> None:
+        """HTTP 403 with text/html content-type → ProviderUnavailableError(retryable=True)."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request()
+
+        cf_body = (
+            b"<html><title>Just a moment...</title>"
+            b"<p>Checking if the site connection is secure</p></html>"
+        )
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(
+                [],
+                status_code=403,
+                headers={"content-type": "text/html; charset=utf-8"},
+                error_body=cf_body,
+            )
+            with pytest.raises(kernel_errors.ProviderUnavailableError) as exc_info:
+                await provider.complete(request)  # type: ignore[union-attr]
+
+        assert exc_info.value.retryable is True
+        assert exc_info.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_real_403_not_cloudflare(self) -> None:
+        """HTTP 403 with JSON response (no CF markers) → AccessDeniedError(retryable=False)."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request()
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(
+                [],
+                status_code=403,
+                headers={"content-type": "application/json"},
+                error_body=b'{"error": "access denied"}',
+            )
+            with pytest.raises(kernel_errors.AccessDeniedError) as exc_info:
+                await provider.complete(request)  # type: ignore[union-attr]
+
+        assert exc_info.value.retryable is False
+        assert exc_info.value.status_code == 403
+
+    # ------------------------------------------------------------------
+    # HTTP 400 sub-dispatch
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_400_context_length_error(self) -> None:
+        """HTTP 400 with 'context length' in body → ContextLengthError(retryable=False)."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request()
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(
+                [],
+                status_code=400,
+                error_body=b'{"error": "This exceeds the context length limit"}',
+            )
+            with pytest.raises(kernel_errors.ContextLengthError) as exc_info:
+                await provider.complete(request)  # type: ignore[union-attr]
+
+        assert exc_info.value.retryable is False
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_400_content_filter_error(self) -> None:
+        """HTTP 400 with 'content filter' in body → ContentFilterError(retryable=False)."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request()
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(
+                [],
+                status_code=400,
+                error_body=b'{"error": "Request blocked by content filter policy"}',
+            )
+            with pytest.raises(kernel_errors.ContentFilterError) as exc_info:
+                await provider.complete(request)  # type: ignore[union-attr]
+
+        assert exc_info.value.retryable is False
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_400_generic_bad_request(self) -> None:
+        """HTTP 400 without special keywords → InvalidRequestError(retryable=False)."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request()
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(
+                [],
+                status_code=400,
+                error_body=b'{"error": "invalid_request_error", "message": "Bad param"}',
+            )
+            with pytest.raises(kernel_errors.InvalidRequestError) as exc_info:
+                await provider.complete(request)  # type: ignore[union-attr]
+
+        assert exc_info.value.retryable is False
+        assert exc_info.value.status_code == 400
+
+    # ------------------------------------------------------------------
+    # httpx.ConnectError → ProviderUnavailableError
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_transport_error_mapped(self) -> None:
+        """httpx.ConnectError during streaming → ProviderUnavailableError(retryable=True)."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request()
+
+        mock_client = MagicMock()
+        mock_client.stream.side_effect = httpx.ConnectError("Connection refused")
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _AsyncCM(mock_client)
+            with pytest.raises(kernel_errors.ProviderUnavailableError) as exc_info:
+                await provider.complete(request)  # type: ignore[union-attr]
+
+        assert exc_info.value.retryable is True
+
+    # ------------------------------------------------------------------
+    # SSEError inside stream → mapped kernel type
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_sse_error_mapped(self) -> None:
+        """SSEError (generic server_error code) → LLMError(retryable=False)."""
+        from amplifier_core import llm_errors as kernel_errors
+        from amplifier_module_provider_openai_chatgpt._sse import SSEError
+
+        provider = self._make_provider()
+        request = self._make_request()
+
+        error_lines = [
+            "data: "
+            + json.dumps(
+                {
+                    "type": "error",
+                    "error": {
+                        "message": "internal server error",
+                        "code": "server_error",
+                    },
+                }
+            ),
+            "data: [DONE]",
+        ]
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(error_lines)
+            with pytest.raises(kernel_errors.LLMError) as exc_info:
+                await provider.complete(request)  # type: ignore[union-attr]
+
+        # SSEError must never escape complete() unmapped
+        assert not isinstance(exc_info.value, SSEError)
+        assert exc_info.value.retryable is False
+
+    @pytest.mark.asyncio
+    async def test_sse_rate_limit_error_mapped(self) -> None:
+        """SSEError with rate_limit code → RateLimitError(retryable=True)."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request()
+
+        error_lines = [
+            "data: "
+            + json.dumps(
+                {
+                    "type": "error",
+                    "error": {
+                        "message": "rate limit exceeded",
+                        "code": "rate_limit_exceeded",
+                    },
+                }
+            ),
+            "data: [DONE]",
+        ]
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _make_sse_response(error_lines)
+            with pytest.raises(kernel_errors.RateLimitError):
+                await provider.complete(request)  # type: ignore[union-attr]
+
+    # ------------------------------------------------------------------
+    # httpx.TimeoutException → LLMTimeoutError
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_timeout_mapped(self) -> None:
+        """httpx.ReadTimeout during streaming → LLMTimeoutError(retryable=True)."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request()
+
+        class _TimeoutOnReadResponse:
+            """Mock response that raises ReadTimeout when its line iterator is advanced."""
+
+            status_code = 200
+            headers = httpx.Headers({})
+
+            async def aiter_lines(self):  # type: ignore[return]
+                raise httpx.ReadTimeout("Request timed out")
+                yield  # makes this an async generator  # noqa: unreachable
+
+            async def aread(self) -> bytes:
+                return b""
+
+        mock_client = MagicMock()
+        mock_client.stream.return_value = _AsyncCM(_TimeoutOnReadResponse())
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = _AsyncCM(mock_client)
+            with pytest.raises(kernel_errors.LLMTimeoutError) as exc_info:
+                await provider.complete(request)  # type: ignore[union-attr]
+
+        assert exc_info.value.retryable is True
+
+
+# ---------------------------------------------------------------------------
+# TestComplete401Retry — mid-session 401 retry logic
+# ---------------------------------------------------------------------------
+
+
+class TestComplete401Retry:
+    """Verify the two-attempt 401 retry loop in complete().
+
+    Design: first 401 triggers a token refresh + header rebuild + retry;
+    a second 401 (or refresh failure) propagates AuthenticationError.
+    Only 401s trigger this path — other error codes are not retried.
+    """
+
+    def _make_provider(self) -> object:
+        from datetime import datetime, timedelta, timezone
+
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        expires_at = (datetime.now(tz=timezone.utc) + timedelta(hours=1)).isoformat()
+        tokens = {
+            "access_token": "test-access-token",
+            "account_id": "acct-123",
+            "expires_at": expires_at,
+        }
+        config = {"default_model": "gpt-4o"}
+        coordinator = MagicMock()
+        coordinator.hooks.emit = AsyncMock()
+        return ChatGPTProvider(config, coordinator, tokens)
+
+    def _make_request(self) -> object:  # type: ignore[return]
+        from amplifier_core.message_models import ChatRequest, Message
+
+        return ChatRequest(messages=[Message(role="user", content="hello")])
+
+    # ------------------------------------------------------------------
+    # 1. First attempt 401, second attempt succeeds
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_401_retry_succeeds(self) -> None:
+        """First attempt returns 401; second attempt succeeds.
+
+        Verifies:
+        - _ensure_valid_tokens called twice (start + retry).
+        - headers rebuilt before second attempt.
+        - response returned normally with correct content.
+        - llm:request emitted exactly once (not re-emitted on retry).
+        """
+        from amplifier_core.message_models import TextBlock
+
+        provider = self._make_provider()
+        request = self._make_request()
+        sse_lines = _make_sse_lines(
+            text="Hello after retry!", input_tokens=8, output_tokens=4
+        )
+
+        mock_401 = _make_sse_response(
+            [], status_code=401, error_body=b'{"error": "unauthorized"}'
+        )
+        mock_200 = _make_sse_response(sse_lines, status_code=200)
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.side_effect = [mock_401, mock_200]
+            with patch.object(
+                provider,  # type: ignore[union-attr]
+                "_ensure_valid_tokens",
+                new_callable=AsyncMock,
+            ) as mock_ensure:
+                result = await provider.complete(request)  # type: ignore[union-attr]
+
+        # Token refresh was triggered once (initial call + retry call = 2 total).
+        assert mock_ensure.await_count == 2, (
+            f"Expected _ensure_valid_tokens called twice, got {mock_ensure.await_count}"
+        )
+        # Both HTTP attempts were made.
+        assert MockClient.call_count == 2
+
+        # Response content is correct from the successful second attempt.
+        assert len(result.content) == 1
+        assert isinstance(result.content[0], TextBlock)
+        assert result.content[0].text == "Hello after retry!"
+
+        # llm:request emitted exactly once — NOT re-emitted on retry.
+        coordinator = provider._coordinator  # type: ignore[union-attr]
+        request_events = [
+            c
+            for c in coordinator.hooks.emit.call_args_list
+            if c.args[0] == "llm:request"
+        ]
+        assert len(request_events) == 1, (
+            f"Expected exactly 1 llm:request event, got {len(request_events)}"
+        )
+
+    # ------------------------------------------------------------------
+    # 2. Both attempts return 401
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_401_retry_fails_twice(self) -> None:
+        """Both attempts return 401 → AuthenticationError raised after second attempt.
+
+        Verifies:
+        - Both HTTP calls were attempted.
+        - AuthenticationError escapes with correct attributes.
+        - llm:response error event is emitted.
+        """
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request()
+
+        mock_401_a = _make_sse_response(
+            [], status_code=401, error_body=b'{"error": "unauthorized"}'
+        )
+        mock_401_b = _make_sse_response(
+            [], status_code=401, error_body=b'{"error": "unauthorized"}'
+        )
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.side_effect = [mock_401_a, mock_401_b]
+            with pytest.raises(kernel_errors.AuthenticationError) as exc_info:
+                await provider.complete(request)  # type: ignore[union-attr]
+
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.retryable is False
+        # Both HTTP attempts were made (first + retry).
+        assert MockClient.call_count == 2
+
+        # llm:response error event must have been emitted.
+        coordinator = provider._coordinator  # type: ignore[union-attr]
+        error_events = [
+            c
+            for c in coordinator.hooks.emit.call_args_list
+            if c.args[0] == "llm:response" and c.args[1].get("status") == "error"
+        ]
+        assert len(error_events) >= 1, (
+            "Expected llm:response error event after double-401"
+        )
+
+    # ------------------------------------------------------------------
+    # 3. First attempt 401, refresh itself fails
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_401_retry_refresh_fails(self) -> None:
+        """First attempt 401; _ensure_valid_tokens() raises during retry.
+
+        Verifies:
+        - AuthenticationError from the failed refresh propagates immediately.
+        - Only one HTTP call was made (refresh failed before second request).
+        """
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request()
+
+        mock_401 = _make_sse_response(
+            [], status_code=401, error_body=b'{"error": "unauthorized"}'
+        )
+        refresh_error = kernel_errors.AuthenticationError(
+            "Token refresh failed — no valid refresh token",
+            provider="openai-chatgpt",
+            retryable=False,
+        )
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = mock_401
+            # First call (start of complete()) succeeds; second call (retry) raises.
+            with patch.object(
+                provider,  # type: ignore[union-attr]
+                "_ensure_valid_tokens",
+                new=AsyncMock(side_effect=[None, refresh_error]),
+            ):
+                with pytest.raises(kernel_errors.AuthenticationError) as exc_info:
+                    await provider.complete(request)  # type: ignore[union-attr]
+
+        assert isinstance(exc_info.value, kernel_errors.AuthenticationError)
+        # Refresh failed before a second HTTP request was issued.
+        assert MockClient.call_count == 1, (
+            "Expected only 1 HTTP call — refresh failed before retry request"
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Non-401 errors are NOT retried
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_non_401_not_retried(self) -> None:
+        """A 500 error is raised immediately — only one HTTP attempt is made."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request()
+
+        mock_500 = _make_sse_response(
+            [], status_code=500, error_body=b"Internal Server Error"
+        )
+
+        with patch(
+            "amplifier_module_provider_openai_chatgpt.provider.httpx.AsyncClient"
+        ) as MockClient:
+            MockClient.return_value = mock_500
+            with pytest.raises(kernel_errors.ProviderUnavailableError):
+                await provider.complete(request)  # type: ignore[union-attr]
+
+        # Only one HTTP call — 500 must not trigger a retry.
+        assert MockClient.call_count == 1, (
+            f"Expected 1 HTTP call for 500 error, got {MockClient.call_count}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestGpt55ProValidator — _validate_gpt_5_5_pro_effort()
+# ---------------------------------------------------------------------------
+
+
+class TestGpt55ProValidator:
+    """Unit tests for _validate_gpt_5_5_pro_effort() and its call site in _build_payload()."""
+
+    def _validate(self, model_id: str, reasoning_param: object) -> None:
+        """Call the module-level validator directly."""
+        from amplifier_module_provider_openai_chatgpt.provider import (
+            _validate_gpt_5_5_pro_effort,
+        )
+
+        _validate_gpt_5_5_pro_effort(model_id, reasoning_param)  # type: ignore[arg-type]
+
+    def _make_provider(self) -> object:
+        from amplifier_module_provider_openai_chatgpt.provider import ChatGPTProvider
+
+        return ChatGPTProvider({"default_model": "gpt-5.5-pro"}, MagicMock(), None)
+
+    def _make_request(self, **kwargs: object) -> object:  # type: ignore[return]
+        from amplifier_core.message_models import ChatRequest, Message
+
+        messages = kwargs.pop("messages", [Message(role="user", content="hello")])
+        return ChatRequest(messages=messages, **kwargs)  # type: ignore[arg-type]
+
+    # ------------------------------------------------------------------
+    # String effort forms — rejected values
+    # ------------------------------------------------------------------
+
+    def test_rejects_low_effort(self) -> None:
+        """String 'low' must raise InvalidRequestError for gpt-5.5-pro models."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        with pytest.raises(kernel_errors.InvalidRequestError):
+            self._validate("gpt-5.5-pro", "low")
+
+    def test_rejects_none_effort_string(self) -> None:
+        """String 'none' must raise InvalidRequestError for gpt-5.5-pro models."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        with pytest.raises(kernel_errors.InvalidRequestError):
+            self._validate("gpt-5.5-pro", "none")
+
+    # ------------------------------------------------------------------
+    # String effort forms — allowed values
+    # ------------------------------------------------------------------
+
+    def test_allows_medium_effort(self) -> None:
+        """String 'medium' must not raise for gpt-5.5-pro models."""
+        self._validate("gpt-5.5-pro", "medium")  # no error expected
+
+    def test_allows_high_effort(self) -> None:
+        """String 'high' must not raise for gpt-5.5-pro models."""
+        self._validate("gpt-5.5-pro", "high")  # no error expected
+
+    def test_allows_xhigh_effort(self) -> None:
+        """String 'xhigh' must not raise for gpt-5.5-pro models."""
+        self._validate("gpt-5.5-pro", "xhigh")  # no error expected
+
+    def test_allows_unset(self) -> None:
+        """None reasoning_param must not raise (effort not specified = caller's choice)."""
+        self._validate("gpt-5.5-pro", None)  # no error expected
+
+    # ------------------------------------------------------------------
+    # Dict effort forms
+    # ------------------------------------------------------------------
+
+    def test_dict_form_low(self) -> None:
+        """Dict {'effort': 'low'} must raise InvalidRequestError for gpt-5.5-pro models."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        with pytest.raises(kernel_errors.InvalidRequestError):
+            self._validate("gpt-5.5-pro", {"effort": "low"})
+
+    def test_dict_form_medium(self) -> None:
+        """Dict {'effort': 'medium'} must not raise for gpt-5.5-pro models."""
+        self._validate("gpt-5.5-pro", {"effort": "medium"})  # no error expected
+
+    # ------------------------------------------------------------------
+    # Model prefix matching
+    # ------------------------------------------------------------------
+
+    def test_non_pro_model_skipped(self) -> None:
+        """'gpt-5.5' (non-pro) with 'low' effort must not raise."""
+        self._validate("gpt-5.5", "low")  # no error expected
+
+    def test_dated_snapshot(self) -> None:
+        """'gpt-5.5-pro-2026-04-23' still matches the gpt-5.5-pro prefix → must raise on 'low'."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        with pytest.raises(kernel_errors.InvalidRequestError):
+            self._validate("gpt-5.5-pro-2026-04-23", "low")
+
+    # ------------------------------------------------------------------
+    # Call-site integration: -fast suffix stripped BEFORE validation
+    # ------------------------------------------------------------------
+
+    def test_fast_suffix_stripped(self) -> None:
+        """_build_payload() with model='gpt-5.5-pro-fast' and reasoning_effort='low'
+        must raise InvalidRequestError, proving the validator runs AFTER -fast is stripped."""
+        from amplifier_core import llm_errors as kernel_errors
+
+        provider = self._make_provider()
+        request = self._make_request(model="gpt-5.5-pro-fast", reasoning_effort="low")
+
+        with pytest.raises(kernel_errors.InvalidRequestError):
+            provider._build_payload(request)  # type: ignore[union-attr]

@@ -274,7 +274,7 @@ class TestParseSSEEvents:
         assert result.model == "gpt-4o"
 
     def test_raw_events_populated(self) -> None:
-        """raw_events contains all successfully parsed JSON events."""
+        """raw_events contains all successfully parsed JSON events when collect_raw=True."""
         ev1 = {
             "type": "response.output_item.done",
             "item": {"type": "message", "content": [{"type": "text", "text": "hi"}]},
@@ -283,9 +283,24 @@ class TestParseSSEEvents:
             _line(ev1),
             _done(),
         ]
-        result = parse_sse_events(lines)
+        result = parse_sse_events(lines, collect_raw=True)
         assert len(result.raw_events) == 1
         assert result.raw_events[0] == ev1
+
+    def test_raw_events_empty_when_collect_raw_false(self) -> None:
+        """raw_events is empty by default (collect_raw=False) even when events are parsed."""
+        ev1 = {
+            "type": "response.output_item.done",
+            "item": {"type": "message", "content": [{"type": "text", "text": "hi"}]},
+        }
+        lines = [
+            _line(ev1),
+            _done(),
+        ]
+        result = parse_sse_events(lines)  # collect_raw defaults to False
+        assert result.raw_events == []
+        # Content is still accumulated normally.
+        assert result.content == "hi"
 
     def test_empty_lines_list(self) -> None:
         """Empty input produces zero-value ParsedResponse."""
