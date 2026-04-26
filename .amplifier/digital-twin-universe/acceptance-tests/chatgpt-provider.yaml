@@ -1,0 +1,111 @@
+# Acceptance tests for the ChatGPT provider module in a DTU environment.
+#
+# DTU profile: chatgpt-provider-reality-check
+# Scope: Everything EXCEPT the OAuth device-code login flow (requires browser).
+#
+# These tests validate the provider works end-to-end with a pre-authenticated
+# token against the live ChatGPT backend API.
+#
+# Run after launching the profile and waiting for readiness:
+#   amplifier-digital-twin launch \
+#     amplifier-module-provider-openai-chatgpt/.amplifier/digital-twin-universe/profiles/chatgpt-provider-reality-check.yaml \
+#     --var OAUTH_TOKEN_FILE=$HOME/.amplifier/openai-chatgpt-oauth.json
+#   amplifier-digital-twin check-readiness <id>
+#   # then run each `command` below via `amplifier-digital-twin exec <id> -- <command>`
+
+name: chatgpt-provider-validation
+description: >
+  Validate the ChatGPT provider module works end-to-end in an isolated DTU
+  environment using a pre-authenticated OAuth token.
+
+tests:
+  # --- Environment Setup ---
+
+  - id: env-amplifier-installed
+    description: Amplifier CLI is installed and runnable
+    type: cli
+    command: "amplifier --version"
+    expected:
+      exit_code: 0
+      output_contains: "amplifier"
+
+  - id: env-token-present
+    description: OAuth token file exists with correct permissions
+    type: cli
+    command: "stat -c '%a' /root/.amplifier/openai-chatgpt-oauth.json"
+    expected:
+      exit_code: 0
+      output_contains: "600"
+
+  - id: env-routing-matrix-present
+    description: Routing matrix file is installed
+    type: cli
+    command: "cat /root/.amplifier/routing/openai-chatgpt.yaml | head -1"
+    expected:
+      exit_code: 0
+      output_contains: "Routing Matrix"
+
+  # --- Provider Mounting ---
+
+  - id: provider-mounts
+    description: >
+      Provider mounts successfully with pre-existing tokens and login_on_mount
+      disabled. Amplifier starts a session without prompting for device-code login.
+    type: cli
+    command: >
+      amplifier run --mode single "Say exactly: PROVIDER_MOUNT_OK"
+    expected:
+      exit_code: 0
+      output_contains: "PROVIDER_MOUNT_OK"
+    timeout: 120
+
+  # --- Inference ---
+
+  - id: inference-text-completion
+    description: >
+      Provider can complete a simple text prompt via the ChatGPT backend API
+      with streaming. The response should contain coherent text.
+    type: cli
+    command: >
+      amplifier run --mode single "What is 2+2? Reply with ONLY the number."
+    expected:
+      exit_code: 0
+      output_contains: "4"
+    timeout: 120
+
+  - id: inference-tool-use
+    description: >
+      Provider supports tool dispatch through the ChatGPT backend. The model
+      should invoke a tool and return a result. Uses bash tool as the simplest
+      built-in tool to exercise the tool call round-trip.
+    type: cli
+    command: >
+      amplifier run --mode single "Run the command echo TOOL_DISPATCH_OK in bash and tell me the output"
+    expected:
+      exit_code: 0
+      output_contains: "TOOL_DISPATCH_OK"
+    timeout: 180
+
+  # --- Token Handling (without OAuth flow) ---
+
+  - id: token-loaded-from-disk
+    description: >
+      Provider reads the token from the expected file path and uses it for
+      authentication. If the token were missing or invalid, the session would
+      fail with an authentication error.
+    type: cli
+    command: >
+      amplifier run --mode single "Reply with exactly: TOKEN_LOADED"
+    expected:
+      exit_code: 0
+      output_contains: "TOKEN_LOADED"
+    timeout: 120
+    depends_on: env-token-present
+
+  # --- Excluded Tests (documented for completeness) ---
+  #
+  # - oauth-device-code-flow: Requires interactive browser, cannot run in DTU
+  # - oauth-token-refresh: Would require an expired access token with valid
+  #   refresh token; risky to manufacture in a live environment
+  # - model-catalog-fetch: Requires assertion on specific model names which
+  #   change with subscription tier; covered by unit tests

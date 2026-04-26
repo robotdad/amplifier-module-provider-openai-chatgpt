@@ -1,0 +1,130 @@
+# Reality-check validation profile for the ChatGPT provider module.
+#
+# Installs Amplifier with the provider-openai-chatgpt module using a
+# pre-authenticated OAuth token copied from the host. The device-code
+# login flow is disabled (login_on_mount: false) so the profile works
+# headlessly inside the container.
+#
+# What this validates:
+#   - Provider mounts successfully with pre-existing tokens
+#   - Model catalog fetches from the live backend
+#   - Inference (streaming text completion) works end-to-end
+#   - Routing matrix resolves agent roles to chatgpt models
+#   - Token refresh works (if access token expires during test)
+#
+# What this does NOT validate (requires interactive browser):
+#   - OAuth device-code login flow
+#   - First-time onboarding experience
+#
+# Out-of-band state required:
+#   - A valid OAuth token JSON file on the host. Default location is
+#     ~/.amplifier/openai-chatgpt-oauth.json (produced by running the
+#     device-code login flow once on your host with the provider).
+#   - The token path must be passed via --var OAUTH_TOKEN_FILE because
+#     the file is host-specific and cannot be checked into the repo.
+#   - Incus running (`incus version`).
+#
+# Launch:
+#   amplifier-digital-twin launch \
+#     amplifier-module-provider-openai-chatgpt/.amplifier/digital-twin-universe/profiles/chatgpt-provider-reality-check.yaml \
+#     --var OAUTH_TOKEN_FILE=$HOME/.amplifier/openai-chatgpt-oauth.json
+#
+# After launch:
+#   amplifier-digital-twin check-readiness <id>
+#   amplifier-digital-twin exec --visual-id "" <id>
+#   amplifier-digital-twin destroy <id>
+
+name: chatgpt-provider-reality-check
+description: >
+  Validate the ChatGPT provider module in isolation. Copies a pre-authenticated
+  OAuth token from the host, installs Amplifier with the provider, and verifies
+  inference works against the live ChatGPT backend API.
+
+base:
+  image: ubuntu:24.04
+
+passthrough:
+  # The ChatGPT backend API (chatgpt.com) and OpenAI auth (auth.openai.com)
+  # must be reachable for inference and token refresh.
+  allow_external: true
+
+provision:
+  files:
+    # Pre-authenticated OAuth token -- avoids device-code flow in headless env.
+    # Path is supplied at launch time via --var OAUTH_TOKEN_FILE.
+    - src: ${OAUTH_TOKEN_FILE}
+      dest: /root/.amplifier/openai-chatgpt-oauth.json
+      mode: "0600"
+
+    # Routing matrix -- maps 13 agent roles to chatgpt models.
+    # Shipped with the module repo; path is relative to this profile file.
+    - src: ../../../routing/openai-chatgpt.yaml
+      dest: /root/.amplifier/routing/openai-chatgpt.yaml
+      mode: "0644"
+
+  setup_cmds:
+    # Base tooling
+    - apt-get update && apt-get install -y git curl ca-certificates
+    - curl -LsSf https://astral.sh/uv/install.sh | sh
+
+    # Install Amplifier CLI from upstream
+    - |
+      export PATH="/root/.local/bin:$PATH"
+      uv tool install git+https://github.com/microsoft/amplifier
+
+    # Register and install the ChatGPT provider module.
+    # Step 1: Register the module source so Amplifier knows where to find it.
+    # Step 2: Install the provider module (downloads and makes it available).
+    # Step 3 (provider add) is interactive and runs post-launch -- we skip it
+    # by writing the equivalent settings.yaml directly below.
+    - |
+      export PATH="/root/.local/bin:$PATH"
+      amplifier module add provider-openai-chatgpt \
+        --source git+https://github.com/robotdad/amplifier-module-provider-openai-chatgpt
+    - |
+      export PATH="/root/.local/bin:$PATH"
+      amplifier provider install openai-chatgpt --force
+
+    # Write provider configuration directly.
+    # Normally `amplifier provider add openai-chatgpt` runs an interactive
+    # wizard, but we skip it here by writing the equivalent config.
+    # The settings are written LAST because earlier amplifier commands can
+    # trigger auto-configuration that detects providers on the host
+    # (e.g. Ollama on port 11434 reachable via the gateway).
+    - |
+      cat > /root/.amplifier/settings.yaml << 'EOF'
+      config:
+        providers:
+          - module: provider-openai-chatgpt
+            source: git+https://github.com/robotdad/amplifier-module-provider-openai-chatgpt
+            config:
+              login_on_mount: false
+      modules:
+        providers:
+          - module: provider-openai-chatgpt
+            source: git+https://github.com/robotdad/amplifier-module-provider-openai-chatgpt
+      EOF
+
+    # Verify installation
+    - export PATH="/root/.local/bin:$PATH" && amplifier --version
+
+    # Workspace for test sessions
+    - mkdir -p /home/user/project
+
+update:
+  cmds:
+    # Pull latest provider code without full rebuild.
+    # The Amplifier CLI itself is also reinstalled so any upstream changes
+    # to module loading or provider installation flow are picked up.
+    - rm -rf /root/.amplifier/cache/amplifier-module-provider-openai-chatgpt*
+    - |
+      export PATH="/root/.local/bin:$PATH"
+      uv tool install --reinstall --force git+https://github.com/microsoft/amplifier
+
+readiness:
+  - name: amplifier-installed
+    command: "PATH=/root/.local/bin:$PATH amplifier --version"
+  - name: token-present
+    command: "test -f /root/.amplifier/openai-chatgpt-oauth.json && echo 'Token file found'"
+  - name: routing-matrix-present
+    command: "test -f /root/.amplifier/routing/openai-chatgpt.yaml && echo 'Routing matrix found'"
