@@ -80,7 +80,7 @@ provision:
     - |
       export PATH="/root/.local/bin:$PATH"
       amplifier module add provider-openai-chatgpt \
-        --source git+https://github.com/robotdad/amplifier-module-provider-openai-chatgpt
+        --source git+https://github.com/microsoft/amplifier-module-provider-openai-chatgpt
     - |
       export PATH="/root/.local/bin:$PATH"
       amplifier provider install openai-chatgpt --force
@@ -96,13 +96,13 @@ provision:
       config:
         providers:
           - module: provider-openai-chatgpt
-            source: git+https://github.com/robotdad/amplifier-module-provider-openai-chatgpt
+            source: git+https://github.com/microsoft/amplifier-module-provider-openai-chatgpt
             config:
               login_on_mount: false
       modules:
         providers:
           - module: provider-openai-chatgpt
-            source: git+https://github.com/robotdad/amplifier-module-provider-openai-chatgpt
+            source: git+https://github.com/microsoft/amplifier-module-provider-openai-chatgpt
       EOF
 
     # Verify installation

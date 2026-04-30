@@ -69,7 +69,7 @@ Works in SSH/headless sessions -- the device code flow only requires a browser o
 
 ```bash
 # Clone
-git clone https://github.com/robotdad/amplifier-module-provider-openai-chatgpt.git
+git clone https://github.com/microsoft/amplifier-module-provider-openai-chatgpt.git
 cd amplifier-module-provider-openai-chatgpt
 
 # Install deps (including dev group: amplifier-core, pytest, ruff)
